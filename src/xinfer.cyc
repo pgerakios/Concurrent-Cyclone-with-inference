@@ -1,0 +1,4336 @@
+#include <string.h>
+#include <position.h>
+#include <lineno.h>
+#include <hashtable.h> 
+#include <set.h> 
+#include "warn.h"
+#include "tcpat.h"
+#include "absynpp.h"
+#include "tcutil.h"
+#include "insert_checks.h" // use these exn in the analysis
+#include "evexp.h" // evaluate constant expressions
+#include "toc.h" // uses function from toc to predict insertions
+#include "xinfer.h"
+
+//Debug printing - enable/disable flags
+//#define IOEFFECT_JOIN_DBG
+//#define IOEFFECT_STMT_DBG
+//#define PROPAGATE_S_DBG
+//#define PROPAGATE_E_DBG
+//#define PROPAGATE_LIST_E_DBG
+//#define SUMMARIZE_DBG
+//#define ADD_SUCC_DBG
+//#define  IOEFFECT_E_FNCALL_DBG
+//#define PRINT_SUCC_DBG
+//#define REGION_ACCESSIBLE_DBG
+//#define REGION_LIVE_DBG
+//#define LIVE_FILTERING_DBG
+using Absyn;
+using List;
+extern string_t<`H> last_filename; //cyclone.cyc
+namespace XInfer;
+/****************************************************************
+ *  Data Structure Definitions
+ *
+ *
+ *
+ *
+ ****************************************************************/
+typedef struct Env @`H env_t;
+typedef struct Fenv @`H fenv_t;
+typedef list_t<Absyn::qvar_t,`H> qvlist_t;
+typedef list_t<qvlist_t,`H> qscope_t;
+typedef List::list_t<$(stmt_t,Tcpat::decision_t,
+                       list_t<switch_clause_t>) @`H,`H> 
+        dlist_t; 
+typedef struct Node @`H node_t,*`H node_opt_t;
+typedef Hashtable::table_t	<void @,node_t> se_t;
+typedef list_t<node_t,`H> nlist_t;
+typedef Set::set_t<node_t> nset_t;
+typedef Hashtable::table_t<stmt_t,nlist_t> inverse_t; 
+typedef datatype NodeType @`H node_type_t;
+typedef enum NodeAnnot nannot_t;
+typedef $(qvar_t,list_t<stmt_t,`H>,bool) @`H combined_t; 
+typedef list_t<combined_t,`H> comblist_t;
+typedef $(type_t,type_t,type_opt_t,effect_t,effect_t, 
+          list_t<tvar_t>,throws_t,reentrant_t,attributes_t) finfo_t;
+typedef $(qvar_t,stmt_t) @`H  catch_t;
+typedef list_t<catch_t,`H> catches_t;
+typedef  qvar_t nocatch_t;
+typedef list_t<nocatch_t,`H>  nocatches_t;
+
+typedef datatype Constraint @`H con_t,*`H con_opt_t;
+typedef list_t<con_t,`H> cons_t;
+typedef enum Access access_t;
+typedef struct CallNode @`H cnode_t,*`H cnode_opt_t;
+typedef list_t<cnode_t,`H> cnodes_t;
+typedef struct CgEnv @`r::R cgenv_t<`r::R>; 
+typedef struct GlobEnv @`r::R genv_t<`r::R>;
+typedef struct DotFile @`H dotfile_t, *`H dotfile_opt_t;
+/***************************************************************/
+
+enum Access {
+   Live = 0,  // Live 
+   Rd = 1,  //  Read 
+   Wr = 2,   //  Write
+   Not_Live=3,
+   Not_RW=4,
+   Not_W=5
+};
+
+datatype Constraint {
+  Access(access_t,type_t,seg_t);// read/write, obligatory, xregion
+  Cap(int,int,int,type_t,seg_t);
+  Join (cons_t,cons_t,seg_t);
+  //Spawn:
+      // initial counts using Cap(i,i,i..)
+     // overall effect
+  Spawn (cons_t,cons_t,seg_t);
+  Call(cons_t,seg_t,string_t); // useful for error reporting.
+  Empty; 
+  Undefined;
+};
+
+datatype NodeType {
+  Exp(exp_t);
+  Stmt(stmt_t);
+  Pat(pat_t);
+  Decl(decl_t);
+};
+
+enum NodeAnnot {
+   MayJump = 0, // all exp/stmt are MayJump
+   MustJump =  1
+};
+
+struct Node {
+  node_type_t n;
+  nannot_t annot;
+  seg_t	 loc;
+  cons_t input;
+  cons_t current;
+  cons_t output; // NULL for definite jumps (bottom effect)
+  qvlist_t throws; 
+  nlist_t  succ; // successors -- via jump
+  list_t<decl_t,`H>  enclosing_xrgn;
+  bool   is_exit;
+  unsigned int preds_front;
+  unsigned int preds_front_visited;
+  unsigned int id;
+ };
+
+struct CallNode {
+  fndecl_t  fd;
+  cnodes_t  preds;
+  cnodes_t  succs;
+  bool      visited;
+  int			preds_visited; 
+};
+
+struct CgEnv {
+  cnodes_t   leafs; 
+  cnode_opt_t main;
+  cnode_opt_t current;
+  Hashtable::table_t <fndecl_t,cnode_t> fnmap;
+  Set::set_t<cnode_t> visited;
+};
+
+struct GlobEnv {
+  JumpAnalysis::jump_anal_res_t tables;
+  Hashtable::table_t<fndecl_t,cons_t> fnmap;
+  list_t<dotfile_t,`H> dotfiles;
+};
+
+struct Fenv {
+  qscope_t *`H 		throws; // inferred exceptions
+  Absyn::throws_t	annot; //throws annotation
+  se_t 			nodes;
+  dlist_t 		catch_stack; 
+  fndecl_t	        fd;
+  stmt_t		exit_stmt; 
+  list_t<decl_t,`H>  enclosing_xrgn;
+  bool               is_xrgn_fun;
+  bool					is_recursive;
+};
+
+struct Env {
+  inverse_t inverse;
+  fenv_t fenv;
+  list_t<Absyn::absyn_annot_t,`H> annot;
+  list_t<node_t,`H> succs;
+  bool const_effect;
+  genv_t<`H> genv;
+};
+
+
+struct DotFile {
+  FILE @ dot;
+  bool closed;
+};
+
+/****************************************************************
+ *  Global Variables
+ *
+ *
+ *
+ *
+ ****************************************************************/
+datatype exn {
+   XInfer_error,
+   MustJump_error (node_t)
+};
+datacon(exn,XInfer_error);
+datacon(Constraint,Undefined);
+datacon(Constraint,Empty);
+struct List<con_t,`H> empty_cons = List(&Empty_val,0);
+struct List<con_t,`H> undef_cons = List(&Undefined_val,0);
+
+int  dot_once = false;
+static bool throw_alloc = false;
+static unsigned int next_node_id = 1; // DO NOT CHANGE THIS
+                                      // CAN'T BE LESS THAN ONE
+
+
+/****************************************************************
+ *  Function Prototypes
+ *
+ *
+ *
+ *
+ ****************************************************************/
+//Main Analysis
+void analysis(JumpAnalysis::jump_anal_res_t tables, 
+              list_t<Absyn::decl_t,`H> tds);
+static void analyze_fd(genv_t<`H>,fndecl_t fd) ;
+
+// Utility Functions
+static int getid(type_t);
+static void iter_xrgn(type_t);
+static int hash_type(type_t);
+static int cmptypes(type_t,type_t);
+
+static dotfile_t new_dot_file(string_t);
+static void close_dot_file(dotfile_t);
+static void open_dot_fun(dotfile_t d, string_t name);
+static void close_dot_fun(dotfile_t d);
+static void print_dot_file(dotfile_t d, 
+                           string_t fmt, 
+                           ... inject parg_t ap)
+                __attribute__((format(printf,2,3)));
+static `a env_err(string_t fmt, ... inject parg_t ap)
+    __attribute__((format(printf,1,2), noreturn));
+static `a @`r safe_cast( `a *`r,string_t);
+static int hash_ptr(`a);
+static Hashtable::table_t<`a@,`b> make_ptr_table();
+static throws_t fn_throw_annot(type_t) ;
+static finfo_t  extract_fun_type_info(type_t);
+static fn_info_t fn_type(type_t);
+static $(qvar_opt_t,int) etyp2qvar(exp_t);
+static bool cmp(`a,`a);
+static bool is_tagged_union_project( Absyn::exp_t e2 );
+static bool my_qvar_cmp(qvar_t,qvar_t);
+static list_t<`a,`H> remove_duplicates(bool (@)(`a,`a),list_t<`a,`H>);
+static $(list_t<`a,`r> ,list_t<`a,`r>) split_list( bool (@)(`c,`a),`c ,
+                                                   list_t<`a,`r>,region_t<`r>);
+static bool  is_zero_ptr_deref(exp_t);
+static bool my_qvar_cmp2(qvar_t, catch_t);
+static stmt_t catch2stmt(catch_t);
+static list_t<type_t,`H> xrgns_of(type_opt_t); 
+static list_t<type_t,`H> xrgns_of_pat(pat_t pat);
+static $(int,int) seg2lineno(Position::seg_t);
+static decl_t stmt2decl(stmt_t);
+static void invert_table_kve(stmt_t,stmt_opt_t,$(inverse_t,fenv_t) @`H);
+static string_t escape_string(string_t<`H>);
+
+// GlobEnv-related API
+static  JumpAnalysis::jump_anal_res_t genv_tables(genv_t);
+static  Hashtable::table_t<fndecl_t,cons_t> genv_fd2cons_map(genv_t);
+static struct GlobEnv genv_new(
+                     JumpAnalysis::jump_anal_res_t,
+                     list_t<dotfile_t,`H>);
+list_t<dotfile_t,`H> genv_dotfiles(genv_t);
+
+// Env-related API 
+static genv_t env_genv(env_t);
+static void env_set_fd_cons(env_t,fndecl_t,cons_t);
+static cons_t env_fd2cons(env_t,fndecl_t);
+static env_t new_env(genv_t<`H>,fenv_t);
+static void push_throws_scope(env_t);
+static void pop_throws_scope(env_t,node_t);
+static void push_annot(env_t env,Absyn::absyn_annot_t annot);
+static Absyn::absyn_annot_t peek_annot(env_t env);
+static void pop_annot(env_t env);
+//static void register_stmt_succ(env_t,stmt_t);
+static void add_exception(env_t,exp_t,exp_t);
+static void add_throws(env_t,throws_t,exp_t);
+static qvar_t conv(datatypefield_t d);
+static inverse_t env_inverse(env_t);
+static JumpAnalysis::jump_anal_res_t env_tables(env_t);
+static fenv_t env_fenv(env_t);
+static void env_update_pred_succs(env_t e,stmt_t s, nlist_t left); 
+
+// Fenv-related API
+static void set_recursive(fenv_t); 
+static bool is_recursive(fenv_t); 
+static fenv_t new_fenv(fndecl_t,Position::seg_t,stmt_t);
+static node_t get_exp(fenv_t,exp_t);
+static node_t get_stmt(fenv_t,stmt_t);
+static node_t get_pat(fenv_t,pat_t,seg_t);
+static node_t get_decl(fenv_t,decl_t);
+static void add_stmt_succ(fenv_t,stmt_t,stmt_t);
+static void insert_badalloc_check(fenv_t,exp_t);
+static void insert_null_check(fenv_t,exp_t,string_t);
+static void insert_array_bounds_check(fenv_t,exp_t);
+static void insert_match_check(fenv_t,exp_t);
+static void insert_array_bounds_null_check(fenv_t,exp_t);
+static void add_env_exn(fenv_t,exp_t,Absyn::qvar_t);
+static void register_exp_succs_generic(fenv_t,exp_t,list_t<qvar_t,`r>,bool);
+static void register_exp_succs(fenv_t,exp_t,list_t<qvar_t,`r>); 
+static void register_exp_throwsany(fenv_t,exp_t e);
+static void register_exp_succ(fenv_t,exp_t,qvar_t);
+static node_t find_pat(fenv_t env,stmt_t handler);
+static void add_throws_effect(fenv_t,exp_t,comblist_t cl);
+static stmt_t exit_stmt(fenv_t);
+static void push_enclosing_xrgn(fenv_t,decl_t);
+static void pop_enclosing_xrgn(fenv_t);
+static list_t<decl_t,`H> enclosing_xrgns(fenv_t);
+static void push_catch_block(fenv_t,stmt_t,
+                             Tcpat::decision_t,
+                             list_t<switch_clause_t,`H>);
+static void pop_catch_block(fenv_t);
+static dlist_t fenv_catch_stack(fenv_t);
+static fndecl_t fenv_get_fd(fenv_t);
+static bool fenv_isxrgn(fenv_t);
+
+//Node-related API
+static void  set_node_id(node_t);
+static int   node_id(node_t);
+static cons_t get_input(node_t);
+static cons_t get_output(node_t);
+static cons_t get_current(node_t);
+static node_t stmt_node(stmt_t);
+static node_t exp_node(exp_t);
+static node_t pat_node(pat_t,seg_t);
+static node_t decl_node(decl_t);
+static void set_throws(node_t,list_t<qvar_t,`r>);
+static void add_succ(node_t,node_t,string_t);
+static void add_succs(node_t,nlist_t,string_t); 
+static exp_t node2exp(node_t);
+static stmt_t node2stmt(node_t);
+static seg_t node2loc(node_t);
+static string_t node2string(node_t);
+static void node_must_jump(node_t);
+static bool node_is_must_jump(node_t);
+static void node_set_enclosing_xrgn(node_t,list_t<decl_t,`H>);
+static list_t<decl_t,`H> node_get_enclosing_xrgn(node_t) ;
+static nlist_t nsig(node_t);
+static nlist_t add_unique(nlist_t,node_t);
+static nlist_t append_unique(nlist_t,nlist_t);
+static nlist_t node_succs(node_t);
+static void node_reset_succs(node_t);
+static void node_print_dot(node_t,dotfile_t);
+
+//Combined-related API
+static void comb_comb($(comblist_t @,bool) @`r,combined_t);
+static void defstmt_comb(stmt_t,combined_t);
+static combined_t q2comb(qvar_t);
+static bool is_uncaught(combined_t);
+static void check_exn_annot(Position::seg_t,throws_t,comblist_t);
+static $(catches_t,nocatches_t)
+ analyze_tree(qvar_t,datatype Tcpat::Decision@,int);
+static comblist_t derive_comblist(dlist_t,list_t<qvar_t,`r>,bool);
+static comblist_t sum_catch(catches_t);
+static void set_nocatch_flag(nocatches_t,combined_t);
+static bool qvar_combined_cmp(qvar_t,combined_t);  
+static $(comblist_t,stmt_opt_t) combine(catches_t,nocatches_t);
+
+// Constraint Generation API
+static bool reentrant_type_visitor(string_t @,type_t); 
+static void check_reentrant(fenv_t,Position::seg_t);
+static void check_access(fenv_t fe, Position::seg_t loc, 
+			  effect_t f,   Absyn::type_opt_t t ); 
+
+// Exception analysis API
+static void add_check_exception(env_t,Absyn::exp_t,Absyn::absyn_annot_t);
+
+// Constraint API
+static string_t con2string(con_t);
+static string_t cons2string(cons_t);
+static bool cons_is_empty(cons_t);
+static bool cons_is_undefined(cons_t);
+static con_t copy_con(con_t);
+static cons_t copy_cons(cons_t);
+static cons_t cons_merge(cons_t,cons_t,seg_t);
+static cons_t cons_append(cons_t,cons_t);
+static cons_t cons_singleton(con_t c);
+static con_t con_empty(); 
+static cons_t cons_empty();
+static con_t con_undefined();
+static cons_t cons_undefined(); 
+static Set::set_t<type_t> xrgns_of_cons(cons_t);
+static bool cons_eq(cons_t,cons_t);
+static bool con_eq(con_t, con_t);
+static cons_t cons_prefix(cons_t);
+
+//Control-flow Graph Construction API 
+static $(nlist_t,nlist_t,bool) concfg_s(env_t,stmt_t,nlist_t);
+static $(nlist_t,nlist_t,bool) _concfg_s(env_t,stmt_t,nlist_t);
+// accept left-most node, return left-most node
+static $(nlist_t,nlist_t,bool) concfg_e(env_t,exp_t,nlist_t);
+static $(nlist_t,nlist_t,bool) _concfg_e(env_t,exp_t,nlist_t);
+
+// Constraint Gathering API
+static void analyze_cfg(env_t,node_t);
+
+// Call graph API 
+static cnode_t get_cgnode(cgenv_t,fndecl_t);
+static void cgenv_register_fd(cgenv_t<`r>,fndecl_t,bool);
+static bool cg_visit_e(cgenv_t<`r>,exp_t);
+static bool cg_visit_s(cgenv_t<`r>,stmt_t);
+static void construct_cg(cgenv_t<`r>,list_t<Absyn::decl_t,`H>);
+static void print_cnode(FILE @,cgenv_t,cnode_t);
+static void print_cg(cgenv_t,string_t);
+static void print_cnode_rev(FILE @,cgenv_t,cnode_t);
+static void print_cg_rev(cgenv_t,string_t);
+static void cgenv_reset_visited(cgenv_t);
+static bool cgenv_is_visited(cgenv_t,cnode_t);
+static void cgenv_set_visited(cgenv_t,cnode_t);
+static struct CgEnv cgenv_new();
+static void cgenv_visit_rev(cgenv_t,void (@`H )(`a,fndecl_t),`a);
+/****************************************************************
+ *  Main Analysis 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+
+void analysis(JumpAnalysis::jump_anal_res_t tables, 
+              list_t<Absyn::decl_t,`H> tds) {
+  let once = dot_once;
+   if(dot_once==false) {
+     dot_once = true;
+     Toc::init_toc_state();
+     let env = cgenv_new();
+     if(get_debug())
+     fprintf(stderr,"\n=============== XINFER ====================");
+     construct_cg(&env,tds);
+     print_cg_rev(&env,"cg_graph_rev.dot");
+     //print_cg(&env,"cg_graph.dot");
+     //cgenv_reset_visited(&env);
+     //
+     let f1 = new_dot_file("prog0.dot");
+     let f2 = new_dot_file("prog1.dot");
+     let l = new List(f1,new List(f2,NULL));
+     // construct global env
+     let genv = genv_new(tables,l);
+      //visit bottom up
+     cgenv_visit_rev(&env,analyze_fd,new genv);
+     close_dot_file(f1);
+     close_dot_file(f2);
+  }
+}
+
+static bool has_cap_or_spawn(cons_t c) {
+  for(;c;c=c->tl) {
+    switch(c->hd) {
+    case &Access(...):
+			return false;
+    case &Cap(...):
+			return true;
+    case &Call(c1,_,_):
+         fallthru(c1,NULL);
+    case &Join(c1,c2,_): 
+			return has_cap_or_spawn(c1) ||
+					 has_cap_or_spawn(c2) ;
+    case &Spawn(c1,c2,_):
+			return true;
+    case &Empty:
+    case &Undefined:
+			return false;
+  }
+ }
+  return false;
+}
+
+//Post-checks check XRGN annot at fun annot 
+static void analyze_fd_post(env_t env,
+                            fndecl_t fd, node_t nexit){
+
+  let s1 = Set::from_list(cmptypes,
+                           xrgns_of(fd->i.effect));
+  let in = get_input(nexit);
+  let s2 = xrgns_of_cons(in);
+  /* fprintf(stderr,"\n\nNAME: %s\nCons2string function in : %s"
+				"\nXRGNS:",*(*fd->name)[1],cons2string(in));*/
+  // Set::iter(iter_xrgn,s2);
+  //fprintf(stderr,"\n");
+  if(!Set::subset(s2,s1)) {  // sanity check
+    fprintf(stderr,"\nRegions of xeffect:");
+    Set::iter(iter_xrgn,s2);
+    fprintf(stderr,"\nRegions of formal effect:");
+    Set::iter(iter_xrgn,s1);
+    env_err("analyze_cfg: lost in translation : %s",
+            cons2string(in));
+  }
+
+  // a function should be annotated as @xrgn ONLY
+  // when there exist some xrgns in the effect
+  if(Set::is_empty(s2)) {
+     if(fd->i.ieffect) 
+       Tcutil::terr(fd->body->loc,"Function %s was declared as @xrgn, but has an \"empty\" xrgn effect: %s.",*(*fd->name)[1],cons2string(in));
+     env_set_fd_cons(env,fd,(in=cons_empty()));
+  } else { 
+    if(!fd->i.ieffect) 
+       Tcutil::terr(fd->body->loc,"Function %s was NOT declared as @xrgn, but has a NON-empty xrgn effect: %s.",*(*fd->name)[1],cons2string(in));
+    env_set_fd_cons(env,fd,in);
+  }
+  if(is_recursive(env_fenv(env)) && has_cap_or_spawn(in)){ 
+     Tcutil::terr(fd->body->loc,"Recursive functions MUST NOT contain"
+							"Cap or Spawn events in their effect. "
+							"Offending function: %s\n"
+							"Effect: %s",
+						*(*fd->name)[1],cons2string(in));
+  }
+  if(get_debug())
+    fprintf(stderr,"\nEffect of function %s : \"%s\"",
+            *(*fd->name)[1],cons2string(in));
+}
+
+static void analyze_fd(genv_t<`H> ge, fndecl_t fd) {
+ let name =  *(*fd->name)[1];
+ let loc  =  fd->body->loc;
+
+ if(get_debug())
+   fprintf(stderr,"\nXInfer: Function declaration (%s) %s",
+           Position::string_of_loc(loc),*(*fd->name)[1]);
+	
+ let s = fd->body;
+ let skip = skip_stmt(s->loc); // dummy exit block
+
+  // insert dummy exit block after the function body
+  stmt_t s0 =  new_stmt(new Seq_s(new_stmt(s->r,s->loc), skip), 
+                        s->loc);
+  // construct a new environment
+  let fenv = new_fenv(fd,loc,skip); 
+  env_t env = new_env(ge,fenv);
+  //begin throws scope
+  push_throws_scope(env);
+  let nskip = get_stmt(fenv,skip);
+
+  /*construct flow graph
+    ignore x-region accessed for the duration	
+    of the exception analysis*/
+
+  let $(left,_,_) = concfg_s(env,s0,new List(nskip,0));
+  // DO NOT REMOVE: reset successor nodes of exit
+  node_reset_succs(nskip); 
+  // Must find a single root
+  if( !left || left->tl ) {
+      for( _ iter = left ; iter ; iter = iter->tl ) {
+         fprintf(stderr,"\nNode : %s \n" ,
+         node2string(iter->hd));
+       }
+       env_err("analyze_Fd:"
+               " Did not find a single root node.");
+  }
+  let root = left->hd;
+  //analyze CFG
+  analyze_cfg(env,root);
+  
+  analyze_fd_post(env,fd,nskip);
+
+  pop_throws_scope(env,get_stmt(fenv,s0));
+  // restore previous fd
+  if(  get_debug()  )	fprintf(stderr,"\n");
+  Warn::flush_warnings();
+}
+
+/****************************************************************
+ *  Utility Functions 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+static int getid(type_t t) {
+  switch(t){
+      case &Evar(_,&VarType(tv),...):
+           fallthru(tv);
+      case &VarType(tv):
+           return tv->identity;
+      default:
+           break;
+  }
+  env_err("getid: %s and %s",Absynpp::typ2string(t),typcon2string(t));
+}
+
+static void iter_xrgn( type_t t ) {
+  fprintf(stderr,"\n\t--> %s (id=%d)", 
+          Absynpp::typ2string(t),getid(t));
+}
+
+static int hash_type(type_t t) {
+//  let ret =Hashtable::hash_string(*(type2tvar(t)->name));
+  //  let ret  = (type2tvar(t)->identity);
+  return getid(t); //ret;
+}
+
+static int cmptypes(type_t t1, type_t t2) {
+//  let ret =  strptrcmp(type2tvar(t1)->name,type2tvar(t2)->name);
+//  return ret;
+//  let a  = type2tvar(t1)->identity;
+//  let b  = type2tvar(t2)->identity;
+//  return a-b;
+   return getid(t1) - getid(t2);
+}
+
+static dotfile_t new_dot_file(string_t name) {
+   let dfile = fopen(name,"w+");
+   let ret = new DotFile(dfile,false);
+   print_dot_file(ret,"digraph Program {\n");
+  return ret;
+}
+
+static void close_dot_file(dotfile_t d){
+  if(!d->closed) {
+     print_dot_file(d,"}");
+     fclose(d->dot);
+     d->closed = true;
+  }
+}
+
+static void open_dot_fun(dotfile_t d, string_t name){
+  print_dot_file(d,"subgraph %s {\ncolor=blue;\nlabel=\"%s\";",
+                 name,name);
+}
+
+static void close_dot_fun(dotfile_t d){
+  print_dot_file(d,"}");
+}
+
+
+static void print_dot_file(dotfile_t d, 
+                           string_t fmt, ... inject parg_t ap) 
+ __attribute__((format(printf,2,3))) {
+   string_t msg = vrprintf(Core::heap_region,fmt,ap);
+   fprintf(d->dot,"%s\n",msg);
+   fflush(d->dot);
+}
+
+static `a env_err(string_t fmt, ... inject parg_t ap) 
+ __attribute__((format(printf,1,2), noreturn)) {
+ string_t msg = vrprintf(Core::heap_region,fmt,ap);
+ if (!Position::error_p()) {
+   fprintf(stderr,"\n\nXInfer error: %s\n",msg);
+   fflush(stderr);
+ }
+ throw &XInfer_error_val;
+}
+
+static `a @`r safe_cast( `a *`r ptr , string_t msg ) {
+  if( ptr == NULL )
+	Warn::impos("XInfer::safe_cast: \"%s\"",msg);
+  else return (`a @`r) ptr;
+}
+
+static int hash_ptr(`a s){  
+ return (int)s; 
+}
+
+static Hashtable::table_t<`a@,`b> make_ptr_table() {  
+ return Hashtable::create(33, Core::ptrcmp, hash_ptr); 
+}
+
+/* Extract @throws annotation
+   If empty then assume @nothrow
+   The list always contains at least one element
+ */
+static throws_t fn_throw_annot( type_t t ) {
+  let z = fn_type(t).throws;   
+  let n = (z!=NULL)?z:Absyn::nothrow();
+      //Absyn::throwsany();
+   return n;
+}
+
+static finfo_t extract_fun_type_info(type_t ftyp){
+   switch (ftyp){
+   	case &FnType(FnInfo{.tvars=tvs,.effect=e1,.ieffect=ieff,
+			    .oeffect=oeff,.throws=t,.reentrant=r,
+		  	    .attributes=a,...}):
+             return $(ftyp,void_type,e1,ieff,oeff,tvs,t,r,a);
+        //
+        case &PointerType(PtrInfo(t,_,PtrAtts(rt,_,_,_,_))):
+      	    ftyp = Tcutil::compress(t);
+            switch (ftyp) {
+         	case &FnType(FnInfo{.tvars=tvs,.effect=e1,
+                                    .ieffect=ieff,.oeffect=oeff,
+                                    .throws=t,.reentrant=r,
+                                    .attributes=a,...}):
+			return $(ftyp,rt,e1,ieff,oeff,tvs,t,r,a);
+			default: env_err("extract_fun_type_info"); 
+	   }
+		break;
+	 default: env_err("extract_fun_type_info");
+  }
+}
+
+static fn_info_t fn_type( type_t t ) {
+ switch(t) {
+     case &FnType(i): 
+          return i;
+     case &PointerType(PtrInfo{&FnType(i),...}): 
+          return i;
+     //case &PointerType(PtrInfo{&TypedefType(_,_,_,&FnType(i)),...}): return i;
+     case &TypedefType(_,_,_,&PointerType(PtrInfo{&FnType(i),...})): 
+          return i;
+     case &Evar(_,&PointerType(PtrInfo{&FnType(i),...}),...): 
+          return i;
+     default:	 
+          env_err(aprintf("XInfer::fn_type %s => %s",
+                          Absynpp::typ2string(t),typcon2string(t)));
+
+ }	
+}
+
+static $(qvar_opt_t,int) etyp2qvar(exp_t e ) {
+  let t = Tcutil::compress(safe_cast(e->topt,"etyp2qvar"));
+  switch(Tcutil::compress(t)){
+      case &PointerType(PtrInfo{t1,...}):
+   	   t1 = Tcutil::compress(t1);
+	   switch(t1){
+             case &AppType(&DatatypeFieldCon(tuf_info),ts):
+      	          switch(tuf_info) {
+		     case {.UnknownDatatypefield = UnknownDatatypeFieldInfo
+   						   (tname,fname,is_x)}:
+   		          fallthru(tname,is_x,fname);
+
+		     case {.KnownDatatypefield=
+                               $(&Datatypedecl(_,tname,_,_,is_x),
+            		       &Datatypefield(fname,_,_,_))}: 
+                          return $(fname,0);
+   		  } 
+		  break;			
+
+   	     case &AppType(&DatatypeCon(_ ),_):
+		  switch(e->r) {
+		    case &Var_e(&Local_b(&Vardecl{_,name,...})):
+		     //HACK ALERT: This is a nasty hack. We assume that
+			// the "exn" inserted in tcstmt.cyc is the same as 
+			//the one in absyn.cyc. We ignore automagically 
+			//inserted stuff, which have no run-time effect
+			 if(*((*name)[1]) == exnstr()) 
+                           return $(NULL,1);
+			 return $(NULL,2);
+		     default: 
+                         return $(NULL,3); 
+		  }
+	      default: 
+                  Warn::impos("etyp2qvar : %s",Absynpp::typ2string(t));
+	  }
+	  break;
+      default:  
+         Warn::impos("etyp2qvar : %s.",Absynpp::typ2string(t));
+  }
+}
+
+static bool cmp( `a a , `a b ) {  
+  return (a==b); 
+}
+
+static bool is_tagged_union_project( Absyn::exp_t e2 ) {
+  type_t   ignore_typ  = void_type;
+   bool     ignore_bool = false;
+   int      ignore_int  = 0;
+   return (Toc::is_tagged_union_project(e2,&ignore_int,&ignore_typ,true));
+}
+
+static bool my_qvar_cmp( qvar_t q1 , qvar_t q2 ) {	
+  //PG: FIXME: this is extremely ad-hoc and should be changed
+   return strcmp(Absynpp::qvar2string(q1), Absynpp::qvar2string(q2)) == 0;
+}
+
+static list_t<`a,`H> remove_duplicates( bool (@eq)(`a,`a), list_t<`a,`H> l ) {
+  if( l == NULL ) return NULL;
+  let $(a,b) = split_list(eq,l->hd,l,Core::heap_region); 
+  return new List(a->hd, remove_duplicates(eq,b));
+}
+
+static $(list_t<`a,`r> ,list_t<`a,`r>) split_list( bool (@pred)(`c,`a),
+						  `c env,list_t<`a,`r> l,
+			   			   region_t<`r> h  ) {
+  list_t<`a,`r>  fst = NULL,snd = NULL, *z = NULL;
+  for( ; l != NULL ; l = l->tl ) { 
+     z = pred(env,l->hd)?&fst:&snd;  
+     *z = rnew(h) List(l->hd,*z);  
+  }
+  return $(List::rrev(h,fst),List::rrev(h,snd));
+}
+
+static bool  is_zero_ptr_deref(exp_t e ) {
+  type_t ptr_type = void_type;
+  type_t elt_type = void_type;
+  bool is_fat = false;
+  return Tcutil::is_zero_ptr_deref(e,&ptr_type,&is_fat,&elt_type);
+}
+
+static bool my_qvar_cmp2(qvar_t q1, catch_t q2){   
+   return my_qvar_cmp(q1,(*q2)[0]); 
+}
+
+static stmt_t catch2stmt(catch_t c){
+   return (*c)[1]; 
+}
+
+static list_t<type_t,`H> xrgns_of( type_opt_t t ) {
+  if(!t) env_err("xrgns_of: 0");
+  let rgns = Tcutil::rgns_of(t);
+  let ret = NULL;
+  switch(rgns) {
+    case &AppType(&JoinCon,iter):
+	 for(  ; iter; iter = iter->tl ) {
+	    let t1 = iter->hd;
+            //printf("\nIter : %s | %s", 
+            //Absynpp::typ2string(t1),typcon2string(t1));
+            switch(t1) {
+	      case &AppType(&AccessCon,&List(r,_)):
+	    	   let k = Tcutil::type_kind(r);
+		   let is_x = Tcutil::kind_eq(k,&Tcutil::xrk);
+       //     fprintf(stderr,"\n\tXRGNS_OF \"%s\" : %s (%d)",            Absynpp::typ2string(t), Absynpp::typ2string(r),is_x);
+		   if(is_x )
+                     ret = new List(r,ret);
+		   break;
+		  case &AppType(&RgnsCon,_): 
+				 break;
+	      default: 
+                env_err("xrgns_of@0: %s",typcon2string(t1)); 
+      	    }
+         } 
+         break;
+    case &AppType(&AccessCon,&List(&VarType(tv),NULL)):
+	      if(is_xrgn_tvar(tv)) {
+				ret = new List(new VarType(tv),ret);
+			}
+			break;
+    case &AppType(&AccessCon,&List(&Evar(_,t0,_,_),NULL)):
+             ret = List::append(ret,xrgns_of(t0));
+			   break;
+    default: 
+      env_err("xrgns_of@1: %s",typcon2string(rgns)); 
+  }
+  return ret;
+}
+
+static list_t<type_t,`H> xrgns_of_pat(pat_t pat) {
+   switch(pat->r){
+      case &Wild_p: 
+           break;
+      case &Var_p(vd,p):
+      	  return xrgns_of_pat(p); 
+      case &Reference_p(vd,p):
+		     return xrgns_of_pat(p); 
+      case &AliasVar_p(tv,vd): 
+           break; //??
+      case &TagInt_p(tv,vd): 
+           break;
+      case &Tuple_p(lpat,_):
+           let x = NULL;
+      	   for(;lpat != NULL ; lpat = lpat->tl)
+              x = List::append(x,xrgns_of_pat(lpat->hd));
+   	   return x;
+      case &Pointer_p(p):
+           let opt = p->topt;
+           if(opt) {
+			    let x;
+ 			    switch (pat->topt) {
+				   case &PointerType(PtrInfo(_,_,PtrAtts(rt,...))):
+ 					    /*fprintf(stderr,"\nHERE! : type : %s", 
+				 			 Absynpp::typ2string(pat->topt));*/
+                    x = xrgns_of(rt);
+			    		  /*let s = Absyn::list2string(x,Absynpp::typ2string);
+						  fprintf(stderr,"\nRegions of type : %s",s);*/
+					     break;
+    			   default:
+					    env_err("xrgns_of_pat: bad pointer type: %s",
+								Absynpp::typ2string(opt)
+							 );
+ 	 	       }
+	          return List::append(x,xrgns_of_pat(p)); 
+			 }
+          else {
+  	  	      //fprintf(stderr,"\nHERE 1! : ");
+            return  xrgns_of_pat(p);
+			  }
+      case &Aggr_p(info,tvlist,dplist,_):
+           let x = NULL;
+           for(; dplist != NULL ; dplist = dplist->tl){
+		        let &$(dlist,p) = dplist->hd;
+              x = List::append(x,xrgns_of_pat(p));
+   	     }
+		     return x;
+     case &Datatype_p(dcl,fld,patlist,_):
+          let x = NULL;
+			  for(;patlist != NULL ; patlist = patlist->tl)
+             x = List::append(x,xrgns_of_pat(patlist->hd)); 
+          return x;
+     case &Null_p: 
+          break;
+    case &Int_p(_,_):  
+         break;
+    case &Char_p(_): 
+         break;
+    case &Float_p(...): 
+         break;
+    case &Enum_p(_,_): 
+         break;
+    case &AnonEnum_p(_,_): 
+         break;
+    default: 
+         env_err("xrgns_of_pat");
+  }
+  return 0;
+}
+
+
+static $(int,int) seg2lineno(Position::seg_t loc) {
+ Lineno::pos_t pos_s = Lineno::pos_of_abs(
+                        Position::get_position_file(),loc);
+ return $(pos_s->line_no,pos_s->col);
+}
+
+static decl_t stmt2decl(stmt_t s) {
+  switch(s->r) { // could be done better
+    case &Decl_s(d,_):  
+         return d;	
+    default: 
+         env_err("stmt2decl");
+  }
+}
+
+static void invert_table_kve(stmt_t s,stmt_opt_t succ,
+                             $(inverse_t,fenv_t) @`H i) {
+  if(!succ) return;
+  let &$(t,fenv) = i;
+  let opt = Hashtable::lookup_opt(t,succ);
+  let n = new List(get_stmt(fenv,s),NULL);
+  if(!opt) 
+    Hashtable::insert(t,succ,n);
+  else  // add to end of list
+    *opt = List::append(*opt,n);
+}
+
+/*write a string as a C string to stream
+   Params: str - the string
+           fp - output file
+   Notes:handles escapes */
+static string_t escape_string(string_t<`H> str) {
+ static string_t escape = "\\\a\b\n\r\t\'\"\f\v";
+ static string_t map = "\\abnrt'\"fv";
+ let extra = 0;
+ let len  = 0;
+ for(_ iter = str;*iter != '\0';iter++,extra++,len++) 
+   if(strchr(escape,*iter)) extra++;
+ if(extra == len) return str; 
+ char *@fat `H ret = calloc((extra+1), sizeof(char));
+ let  iter0 = ret;
+ for(_ iter = str;*iter != '\0';iter++,iter0++) { 
+   let ch = *iter;
+   int i;
+   for(  i = 0; escape[i] != '\0' ; i++ ) {
+      if(ch == escape[i]) {
+         *iter0++ = '\\';
+         *iter0 = map[i];
+         break;
+      }
+   }
+   if( escape[i] == '\0') *iter0 = ch;
+ }
+ *iter0 = '\0';
+ return (string_t) ret; 
+}
+
+/****************************************************************
+ *  GlobalEnv-related API
+ *
+ *
+ *
+ *
+ ****************************************************************/
+static  JumpAnalysis::jump_anal_res_t genv_tables(genv_t ge) {
+  return ge->tables;
+}
+
+static  Hashtable::table_t<fndecl_t,cons_t> genv_fd2cons_map(genv_t ge) {
+  return ge->fnmap;
+}
+
+static struct GlobEnv genv_new(
+      JumpAnalysis::jump_anal_res_t tables,
+      list_t<dotfile_t,`H> files ) {
+   let ht = Hashtable::create(33, Core::ptrcmp,
+                              hash_ptr);
+   return GlobEnv(tables,ht,files);
+}
+
+list_t<dotfile_t,`H> genv_dotfiles(genv_t g) {
+ return g->dotfiles;
+}
+/****************************************************************
+ *  Env-related API
+ *
+ *
+ *
+ *
+ ****************************************************************/
+
+static genv_t env_genv(env_t e) {
+ return e->genv;
+}
+
+static void env_set_fd_cons(env_t env,fndecl_t fd,cons_t c) {
+ let map = genv_fd2cons_map(env->genv);
+ Hashtable::insert(map,fd,c);
+}
+
+static cons_t env_fd2cons(env_t env,fndecl_t fd) {
+ let isxrgn = fd->i.ieffect !=0;
+ if(!isxrgn) return cons_empty();
+ //let isxrgn = fn_type(vd->type).ieffect !=0;
+ let map = genv_fd2cons_map(env->genv);
+ let opt = Hashtable::lookup_opt(map,fd);
+ if(!opt) {
+  let name =  *(*fd->name)[1];
+   env_err("env_fd2cons: could not find effect for: %s\n",
+            name);
+ }
+ return *opt;
+}
+
+static env_t new_env(genv_t<`H> ge,fenv_t f) {
+  let tables = genv_tables(ge);
+//  let ht = genv_fd2cons_map(ge);
+  let t0 = Hashtable::lookup_opt(tables->succ_tables,fenv_get_fd(f));
+  inverse_t i = Hashtable::create(33, Core::ptrcmp, hash_ptr);
+  if(t0) 
+    Hashtable::iter_c(invert_table_kve,*t0,new $(i,f)); 
+  return new Env(i,f,NULL,NULL,false,ge);
+}
+
+static void push_throws_scope( env_t te  ) {
+  let fenv = env_fenv(te);
+  *(fenv->throws) = new List(NULL,*fenv->throws);
+}
+
+static void pop_throws_scope( env_t te , node_t n) {
+  let fenv = env_fenv(te);
+  if( *fenv->throws == NULL ) 
+   env_err("XInfer::pop_throws_scope");
+  else {
+   let hd = (*fenv->throws)->hd;
+   set_throws( n, hd );
+   *fenv->throws = (*fenv->throws)->tl;
+   if( *fenv->throws != NULL && (*fenv->throws)->hd != NULL )
+    for(  ; hd != NULL ; hd = hd->tl ) 
+     (*fenv->throws)->hd = add_qvar((*fenv->throws)->hd,hd->hd);
+  }
+}
+
+static void push_annot(env_t env, 
+                       Absyn::absyn_annot_t annot){
+  env->annot = new List(annot,env->annot);
+}
+
+static Absyn::absyn_annot_t peek_annot(env_t env){
+  if( env->annot == NULL ) env_err("peek_annot");
+  return env->annot->hd;
+}
+
+static void pop_annot(env_t env){
+  if( env->annot == NULL ) env_err("pop_annot");
+  env->annot = env->annot->tl;
+}
+
+/*
+// Register the successor node of this node to the current environment
+// We only care about jump statements (Break,Continue,Goto,Fallthru,Return)
+static void register_stmt_succ( env_t env , stmt_t s) {
+  let fenv = env->fenv;
+  switch(s->r){
+  	 case &Break_s:  
+              fallthru;
+	 case &Continue_s: 
+              fallthru;
+	 case &Goto_s(_):
+          //PG: 08/11/2010 
+          // don't add succs for fallthru
+          //    fallthru;
+         //case &Fallthru_s(_,_): 
+              break;
+	 // if it is a Return statement then 
+         //the dummy exit block is the successor node
+//	 case &Return_s(_): 
+//      add_stmt_succ(fenv,s ,
+//                       exit_stmt(fenv)); 
+	      //add_enclosing(env->fenv,get_stmt(env->fenv,s));
+   	      return;
+	 default: 
+              return; //ignore others
+  }
+  let tab = env->tables->succ_tables;
+  let opt = Hashtable::lookup_opt(tab,fenv->fd);
+  if( opt == NULL ) env_err("Xinfer::register_stmt_succ");
+  else switch(Hashtable::lookup_opt(*opt,s)) {
+      case &opt1 && opt1 != NULL: 
+	   add_stmt_succ(fenv,s ,opt1); 
+	   //add_enclosing(env->fenv,get_stmt(env->fenv,s));
+	   break;
+      default: 
+ 	   add_stmt_succ(fenv,s,exit_stmt(fenv)); 
+	   //add_enclosing(env->fenv,get_stmt(env->fenv,s));
+	   break;
+  }
+}*/
+
+static void add_exception(env_t te, exp_t e0, exp_t e ) {
+  let fenv = env_fenv(te);
+  let $(q,b) = etyp2qvar(e);
+  if( q != NULL)
+    add_env_exn(fenv,e0,q);
+  else switch(b) {
+	case 1:
+               break;
+	default:
+               register_exp_throwsany(fenv,e); 
+               break;
+	 /*
+	 case 2: register_exp_throwsany(te->fenv,e); break; //no data flow analysis. loose precision
+	 case 3: let n = get_exp(te->fenv,e);
+				if( n->throwsany ) register_exp_throwsany(te->fenv,e); 
+				else if( n->throws ) register_exp_succs(te->fenv,e,n->throws);
+				else printf("\nNo analysis for exp at %d", e->loc);
+		break;
+	 default: break; //ignore exn
+    */
+  }
+}
+
+static void add_throws(env_t te,throws_t iter,exp_t e){
+  let fenv = env_fenv(te);
+  Position::seg_t loc = e->loc;
+  if( Absyn::is_nothrow(iter) ) return; 
+  else if( Absyn::is_throwsany(iter) )
+    register_exp_throwsany(fenv,e);
+  else {
+    let x = *safe_cast(fenv->throws,"add_throws");
+    let qvs = List::map(conv,iter);
+    register_exp_succs(fenv,e,qvs);
+    for( ; iter != NULL ; iter = iter->tl ) 
+       x->hd = add_qvar(x->hd,throws_hd2qvar(iter));
+  }
+}
+
+static qvar_t conv( datatypefield_t d) {
+    return d->name; 
+}
+
+
+static inverse_t env_inverse(env_t e) {
+  return e->inverse;
+}
+
+static JumpAnalysis::jump_anal_res_t env_tables(env_t e) {
+ return genv_tables(e->genv);
+}
+
+static fenv_t env_fenv(env_t e) {
+  return e->fenv;
+}
+
+static void env_update_pred_succs(env_t e,stmt_t s, nlist_t left) {
+ let i = e->inverse;
+  switch(Hashtable::lookup_opt(i,s)) {
+    case &preds:
+        for(;preds;preds=preds->tl) {
+           // fprintf(stderr,"\nHERE!");
+           let pred = preds->hd;
+           set_node_id(pred);
+           add_succs(pred,left,
+                     "env_update_pred_succs");
+        }
+        break;
+    default:
+         break;
+  }
+}
+
+/****************************************************************
+ * Fenv-related API  
+ *
+ *
+ *
+ *
+ ****************************************************************/
+static void set_recursive(fenv_t f) {
+  f->is_recursive = true;
+}
+
+static bool is_recursive(fenv_t f) {
+ return f->is_recursive;
+}
+
+static fenv_t new_fenv(fndecl_t fd,	
+                       Position::seg_t loc, stmt_t s ){
+  let ftyp = (type_t) fd->cached_type;
+  return new
+    Fenv{	
+		  .throws = new NULL,
+        .annot = fn_throw_annot(ftyp),
+		  .nodes = make_ptr_table(),
+	 	  .catch_stack = NULL,
+		  .fd  = fd,
+		  .exit_stmt = s,
+        .enclosing_xrgn = NULL,
+        .is_xrgn_fun = fd->i.ieffect != 0,
+		  .is_recursive = false
+   };
+}
+
+static node_t get_exp(fenv_t env, exp_t e ){
+  let x = Hashtable::lookup_opt(env->nodes,(void @)e);
+  if( x == NULL ){
+    let n = exp_node(e);
+    Hashtable::insert(env->nodes,(void @)e,n);
+    return n;
+  }
+  else return *x;
+}
+
+static node_t get_stmt(fenv_t env, stmt_t s ){
+  let x = Hashtable::lookup_opt(env->nodes,(void @)s);
+  if( x == NULL ){
+    let n = stmt_node(s);
+    if(env->exit_stmt == s) n->is_exit = true;
+    Hashtable::insert(env->nodes,(void @)s,n);
+    return n;
+  }
+  else return *x;
+}
+
+static node_t get_pat(fenv_t env, pat_t e,seg_t loc){
+  let x = Hashtable::lookup_opt(env->nodes,(void @)e);
+  if( x == NULL ){
+    let n = pat_node(e,loc);
+    Hashtable::insert(env->nodes,(void @)e,n);
+    return n;
+  }
+  else return *x;
+}
+
+
+static node_t get_decl(fenv_t env, decl_t e ){
+  let x = Hashtable::lookup_opt(env->nodes,(void @)e);
+  if( x == NULL ){
+    let n = decl_node(e);
+    Hashtable::insert(env->nodes,(void @)e,n);
+    return n;
+  }
+  else return *x;
+}
+
+static void add_stmt_succ( fenv_t env , stmt_t s , stmt_t s1) {
+  let n1 = get_stmt(env,s);
+  let n2 = get_stmt(env,s1); //add it if it hasn't been added
+  add_succ(n1,n2,"add_stmt_succ");
+}
+
+static void insert_badalloc_check( fenv_t env, exp_t e){
+   if( get_debug() )	
+     Warn::warn(e->loc,"inserted bad alloc check.");
+   add_env_exn(env,e,Absyn::get_qvar(Absyn::De_AllocCheck));
+}
+
+static void insert_null_check( fenv_t env, exp_t e, string_t msg) {
+  if( get_debug() )
+    Warn::warn(e->loc,"inserted NULL check (%s, expression = %s).",msg,
+		Absynpp::exp2string(e));
+  add_env_exn(env,e,Absyn::get_qvar(Absyn::De_NullCheck));
+}
+
+static void insert_array_bounds_check( fenv_t env, exp_t e) {
+   if( get_debug() )
+     Warn::warn(e->loc,"inserted BOUNDS check.");
+   add_env_exn(env,e,Absyn::get_qvar(Absyn::De_BoundsCheck));
+}
+
+static void insert_match_check( fenv_t env, exp_t e) {
+  if( get_debug() )
+    Warn::warn(e->loc,"inserted MATCH check.");
+  add_env_exn(env,e,Absyn::get_qvar(Absyn::De_PatternCheck));
+}
+
+static void insert_array_bounds_null_check( fenv_t env , exp_t e) {
+  if( get_debug() )
+    Warn::warn(e->loc,"inserted BOUNDS and NULL check.");
+  add_env_exn(env,e,Absyn::get_qvar(Absyn::De_BoundsCheck));
+  add_env_exn(env,e,Absyn::get_qvar(Absyn::De_NullCheck));
+}
+
+// this is called by all functions that wish to register an exception
+// registers q as one of the successor nodes of e 
+static void add_env_exn( fenv_t te , exp_t e , Absyn::qvar_t q ) {
+  let x = *safe_cast(te->throws,"add_env_exn");
+  register_exp_succ(te,e,q) ;
+  x->hd = add_qvar(x->hd,q);
+}
+
+static void register_exp_succs( fenv_t env, exp_t e, list_t<qvar_t,`r> ql ){ 
+ register_exp_succs_generic(env,e,ql,false);
+}
+
+static void register_exp_throwsany( fenv_t env, exp_t e ){ 
+//printf("\nTHROWSANY : %s\n",Absynpp::exp2string(e));fflush(stdout);
+  register_exp_succs_generic(env,e,NULL,true); 
+}
+
+static void register_exp_succ( fenv_t env, exp_t e , qvar_t q){  
+ let l = List(q,NULL);   
+ register_exp_succs(env,e,&l); 
+}
+
+// All exception-throwing expressions call this function 
+static void register_exp_succs_generic( fenv_t env, exp_t e,
+   	    	  	         	list_t<qvar_t,`r> ql, bool any) {
+ if( ql == NULL && any == false ) 
+   env_err("register_exp_succs_generic");
+ //create a map exn -> handlers, given the "catch stack"
+ // and the exceptions (ql) thrown
+ // the map represents all possible handlers that will 
+ // catch the exception.
+ let comb = derive_comblist(fenv_catch_stack(env),ql,any);  
+ //printf("\nREGISTER_EXP_SUCCS BEGIN\n\n%s\n\nREGISTER_EXP_SUCCS\n\n",
+ //			comblist2string(comb)); fflush(stdout);
+ //check if uncaught exn match throws annotation	
+ if( is_throwsany(env->annot) == false )
+   check_exn_annot(e->loc,env->annot,comb);
+ //if( any ) comb = List::filter(not_any_qvar,comb);
+  add_throws_effect(env,e,comb); //update successor nodes of e 
+}
+
+static node_t find_pat(fenv_t env,stmt_t handler) {
+   let iter0 = fenv_catch_stack(env);
+   for(_ iter = fenv_catch_stack(env);iter;iter = iter->tl){
+      for(_ it=(*iter->hd)[2];it;it=it->tl) {
+         let hd = it->hd;
+         if( hd->body == handler ) 
+           return get_pat(env,hd->pattern,hd->body->loc);
+      }
+   }
+   env_err("find_pat len(catch)=%d handler=%s",
+            List::length(iter0), Absynpp::stmt2string(handler));
+}
+
+static void add_throws_effect(fenv_t env, exp_t e, comblist_t cl) {
+  qvlist_t throws; 
+  nlist_t  succ; // successors -- via jump
+  node_t n =  get_exp(env,e);
+  //dummy exit statement for func
+  let ex = exit_stmt(env); 
+  let nexit =get_stmt(env,ex);
+  for( ; cl != NULL ; cl = cl->tl ) {
+     let c = *cl->hd;
+     n->throws = add_qvar(n->throws,c[0]);
+     //add dummy exit stmt if uncaught
+     // printf("\nUncaught ? %d \n", c[2] ); fflush(stdout);
+     let iter =  (c[2])?new List(ex,c[1]):c[1];
+     let found_pat = false;
+     for( ; iter != NULL ; iter = iter->tl ) {
+        //add it if it hasn't been added
+        // n --> pat --> handler
+        let s_handler = iter->hd;
+        if(s_handler != ex) {
+          let n_handler = get_stmt(env,s_handler);
+          let n_pat = find_pat(env,s_handler); 
+           add_succ(n,n_pat,"add_throws_effect 1");
+           //printf("\nADDING PRED PAT: %s --> %s (%p)\n", node2string(n), node2string(n_pat),n_pat);
+           //add_succ(n_pat,n_handler,"add_throws_effect 2");
+        } else 
+          add_succ(n,nexit,"add_throws_effect 3");
+     }
+  }
+}
+
+static stmt_t exit_stmt(fenv_t f) {
+ return f->exit_stmt; 
+}
+
+
+static void push_enclosing_xrgn(fenv_t env, decl_t s) {
+  let tl =  env->enclosing_xrgn;
+  env->enclosing_xrgn = new List(s,tl);
+}
+
+static void pop_enclosing_xrgn(fenv_t env) {
+  let tl =  env->enclosing_xrgn;
+  if( tl == NULL ) env_err("pop_enclosing_xrgn");
+  env->enclosing_xrgn = tl->tl;
+}
+
+static list_t<decl_t,`H> enclosing_xrgns(fenv_t env) {
+  return List::copy(env->enclosing_xrgn);
+}
+
+static void push_catch_block( fenv_t fenv,stmt_t s,
+                             Tcpat::decision_t  d,
+                             list_t<switch_clause_t,`H> l){
+ fenv->catch_stack = new List(new $(s,d,l),
+                              fenv->catch_stack);
+}
+
+static void pop_catch_block( fenv_t fenv) {
+  if( fenv->catch_stack == NULL )  return;
+  let l =  fenv->catch_stack;
+  fenv->catch_stack = l->tl;
+}
+
+static dlist_t fenv_catch_stack(fenv_t fenv) {
+ return  fenv->catch_stack;
+}
+
+static fndecl_t fenv_get_fd(fenv_t fenv) {
+ return fenv->fd;
+}
+
+static bool fenv_isxrgn(fenv_t f) { 
+  return f->is_xrgn_fun;
+}
+/****************************************************************
+ *  Node-related API 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+static void  set_node_id(node_t n) {
+/*  if(n->id)
+   env_err("set_node_id: %s [id=%d]",
+            node2string(n),n->id);*/
+  if(!n->id)
+     n->id=next_node_id++;
+  //fprintf(stderr,"\nID [id=%d]for: %s ",
+  //        n->id,node2string(n));
+}
+
+static int node_id(node_t n) {
+  return n->id;
+}
+
+
+static cons_t get_input(node_t n) {
+   return n->input;
+}
+
+static cons_t get_output(node_t n) {
+   return n->output;
+}
+
+static cons_t get_current(node_t n) {
+   return n->current;
+}
+
+static node_t stmt_node( stmt_t s ){
+  return new Node( new Stmt(s),MayJump,s->loc,cons_undefined(),
+                   cons_undefined(),cons_undefined(),
+                   NULL,NULL,NULL,false,0,0,0);
+}
+
+static node_t pat_node(pat_t s, seg_t loc){
+  return new Node( new Pat(s),MayJump,loc,cons_undefined(),
+                   cons_undefined(),cons_undefined(),
+                   NULL,NULL,NULL,false,0,0,0);
+}
+
+static node_t decl_node( decl_t d ){
+  return new Node( new Decl(d),MayJump,d->loc,cons_undefined(),
+                   cons_undefined(),cons_undefined(),
+                   NULL,NULL,NULL,false,0,0,0);
+}
+
+static node_t exp_node( exp_t e ) {
+  return new Node( new Exp(e),MayJump,e->loc,cons_undefined(),
+                   cons_undefined(),cons_undefined(),
+                   NULL,NULL,NULL,false,0,0,0);
+}
+
+static void set_throws(node_t n, list_t<qvar_t,`r>  ql){
+    n->throws = List::copy(ql); 
+}
+
+static void add_succ(node_t n1 , node_t n2, string_t msg) {
+  if(!List::exists_c(cmp,n2,n1->succ)) {
+//   #ifdef ADD_SUCC_DBG
+    let n1_id = node_id(n1);
+    let n2_id = node_id(n2);
+    /*fprintf(stderr,"\nSUCC: %s [id=%d] ---> %s [id=%d]",
+            node2string(n1),n1_id,node2string(n2),
+            n2_id);*/
+//  #endif
+  if( n1_id > n2_id  || n1_id == 0)
+    n2->preds_front++;
+  n1->succ = new List(n2,n1->succ);
+ }
+}
+
+static void add_succs(node_t n, nlist_t nl,string_t s ) {
+  for( ; nl ; nl=nl->tl ) {
+      add_succ(n,nl->hd,s);
+  }
+}
+
+
+static exp_t node2exp(node_t n){
+  switch(n->n){
+    case &Exp(e):
+         return e;
+    default:
+         env_err("node2exp");
+   }
+}
+
+static stmt_t node2stmt(node_t n){
+  switch(n->n){
+    case &Stmt(s):
+         return s;
+    default:
+         env_err("node2stmt");
+   }
+}
+
+static string_t node2string(node_t n) {
+  switch(n->n){
+    case &Stmt(s):
+         if(n->is_exit) return "EXIT";
+         switch(s->r){
+          case &Skip_s:
+               return "skip";
+          default:
+               return Absynpp::stmt2string(s);
+         }
+    case &Exp(e):
+         return Absynpp::exp2string(e);
+    case &Pat(p):
+         return Absynpp::pat2string(p);
+    case &Decl(d):
+         return Absynpp::decl2string(d);
+   }
+}
+
+static seg_t node2loc(node_t n) {
+   return n->loc;
+}
+
+static void node_must_jump(node_t n) {
+   n->annot = MustJump;
+}
+
+static bool node_is_must_jump(node_t n) {
+  return n->annot == MustJump;
+}
+
+static void node_set_enclosing_xrgn(node_t n,
+                                    list_t<decl_t,`H> l) {
+   n->enclosing_xrgn = l;
+}
+
+static list_t<decl_t,`H> node_get_enclosing_xrgn(node_t n) {
+   return n->enclosing_xrgn;
+}
+
+static nlist_t nsig(node_t n) { 
+  return new List(n,NULL);
+}
+
+static nlist_t add_unique(nlist_t nl, node_t n) {
+  if(!nl) return new List(n,0);
+  let nl0 = nl;
+  for( ; nl && nl->tl != 0 ; nl=nl->tl) 
+     if(n == nl->hd) return nl0;
+  if(nl && nl->hd != n) nl->tl = new List(n,0);
+  return nl0;
+}
+
+static nlist_t append_unique(nlist_t n0, nlist_t n1) {
+  for( ; n1 ; n1 = n1->tl )
+      n0 = add_unique(n0,n1->hd);
+  return n0;
+}
+
+static nlist_t node_succs(node_t n) {
+  return List::copy(n->succ);
+}
+
+static void node_reset_succs(node_t n) {
+   n->succ = 0;
+}
+
+static void node_print_dot(node_t n, dotfile_t f) {
+  let str = node2string(n);
+  let str0 =  aprintf("%s id=%d,%d/%d",
+      escape_string(str),node_id(n), 
+      n->preds_front_visited,
+      n->preds_front
+      );
+  ///printf("\nFORMATED: %s",str0);
+  let $(l1,c1) = seg2lineno(node2loc(n));
+  print_dot_file(f,"%d%d%d [label=\"%s\"];",
+                 (int) n,l1,c1, str0);
+  for(_ iter = n->succ; iter ; iter=iter->tl) {
+    let nlabel = escape_string(cons2string(get_output(n))); 
+    let $(l2,c2) = seg2lineno(node2loc(iter->hd));
+    print_dot_file(f,"%d%d%d -> %d%d%d [label=\"%s\"];", 
+                  (int) n,l1,c1, (int) iter->hd,l2,c2,nlabel);
+  }
+}
+/****************************************************************
+ *  Combined-related API 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+
+static void comb_comb($(comblist_t @,bool) @`r par, combined_t newl) {
+  let $(curr,any) = *par;
+  let iter = *curr;
+  let q = (*newl)[0];
+  for( ; iter != NULL ; iter = iter->tl )
+     if(  my_qvar_cmp((*iter->hd)[0],q)) {
+       if((*iter->hd)[2] ) { //uncaught
+         (*iter->hd)[1] = remove_duplicates(cmp,//add handlers
+   	 	               List::append((*iter->hd)[1],(*newl)[1]));
+         (*iter->hd)[2] = (*newl)[2]; //update status
+       }
+     return;
+  }
+  if(any) 
+    *curr = new List(newl,*curr); 
+}
+
+static void defstmt_comb(stmt_t def , combined_t comb) {
+ if( (*comb)[2] ) {
+    (*comb)[2] = false;
+    (*comb)[1] = remove_duplicates(cmp,new List(def,(*comb)[1]));
+  }
+}
+
+static combined_t q2comb(qvar_t q) {
+  return new $(q,NULL,true); 
+} //a new unacaught exception,with no "may catch" handlers
+
+static bool is_uncaught(combined_t c) {
+  return (*c)[2];  
+}
+
+static void check_exn_annot(Position::seg_t loc, throws_t annot,
+                            comblist_t comb){
+  if( annot == NULL ) return;
+  for(; comb != NULL ; comb = comb->tl){
+     let c = *comb->hd;
+     if( c[2] && !exists_throws(annot,c[0])){
+	 let s1 = throws_qvar2string(c[0]);
+	 let s2 = throws2string(annot);
+	 Tcutil::terr(loc,"Expression throws uncaught exception %s. %s is not declared in throws annotation  %s so it needs to be caught.",s1,s1,s2);
+     }
+  }
+}
+
+static $(catches_t,nocatches_t)
+ analyze_tree( qvar_t n, datatype Tcpat::Decision@ d,  int depth) 
+{
+  let in = NULL;
+  let out = NULL;
+  switch (d) {
+   case &Tcpat::Failure(_): 
+        env_err("analyze_tree");
+   case &Tcpat::Success(rhs):
+        if(depth > 0) {
+	 if( is_exn_stmt(rhs-> rhs) )
+	   out = new List(n,out);
+	 else
+	  in  = new List(new $(n,rhs->rhs),in);
+	} else if( depth == 0 ) { //special case
+          if( is_exn_stmt(rhs-> rhs) ) 
+            return $(NULL,NULL);//empty catch block
+   	     //just default case in catch block
+	  else
+             in = new List( new $(default_case_qvar(),rhs->rhs),NULL);
+        }
+	else 
+            env_err("analyze_tree impos");
+        break;
+   case &Tcpat::SwitchDec(_,cases,def): // cases , default case
+	if( depth == 0 ) {
+	  for(; cases != NULL; cases = cases->tl) {
+             let $(pt,d) = *cases->hd;
+	     switch(pt) {
+	       case &Tcpat::EqExtensibleDatatype(_,f):
+	 	    let $(in1,out1) = analyze_tree(f->name,d,1);
+		    in = List::append(in,in1);
+		    out =  List::append(out,out1);
+		    break;
+	       default: 
+                    env_err("analyze_tree");
+	    }
+          } 
+       } else if(depth > 0) {
+	  for(; cases != NULL; cases = cases->tl) {
+	     let $(pt,d) = *cases->hd;
+	     let $(in1,out1) = analyze_tree(n,d,1);
+	     in = List::append(in,in1);
+	     out = List::append(out,out1);
+       }
+      } else 
+         env_err("analyze_tree impos");
+      let $(in1,out1) = analyze_tree(n,def,depth);
+      in = List::append(in,in1);
+      out = List::append(out,out1);
+      break;
+  }
+  return $(in,out);
+}
+
+static comblist_t derive_comblist(dlist_t iter, list_t<qvar_t,`r> ql,bool any){
+   bool set_def = false;
+   let comb = List::map(q2comb,ql);//start off as uncaught exn list
+   for( ; iter ; iter = iter->tl ) { //walk over catch stack
+      let $(c,nc) = analyze_tree(default_case_qvar(),(*iter->hd)[1],0);
+      let $(newcomb,defstmt) = combine(c,nc);
+      let comb_par = $(&comb,any);
+      List::iter_c(comb_comb,&comb_par,newcomb);//update throws list with the new handlers
+      if( defstmt != NULL ) { //found default handler. Done
+        List::iter_c(defstmt_comb,defstmt,comb);
+	if(any && !set_def) {
+   	  set_def = true;
+	  comb = new List( new $(any_qvar(),new List(defstmt,NULL),false),comb);
+	}
+	break;		
+      }
+      if(!any && !List::exists(is_uncaught,comb)) 
+        break;//all exceptions caught
+   }
+   if(any && !set_def) 
+     comb = new List(new $(any_qvar(),NULL,true),comb);
+   return comb;
+}
+
+static comblist_t sum_catch( catches_t cl ) {
+ if( cl == NULL ) return NULL;
+ let c = cl->hd;
+ let q = (*c)[0];
+ let $(a,b) = split_list(my_qvar_cmp2,q,cl,Core::heap_region); 
+ let stmts = remove_duplicates(cmp,List::map(catch2stmt,a));//duplicate handlers
+ return new List( new $(q,stmts,false), sum_catch(b));
+}
+
+static void set_nocatch_flag(nocatches_t nc, combined_t c) { 
+  if(List::exists_c(my_qvar_cmp,(*c)[0],nc)) 
+    (*c)[2] = true; 
+}
+
+static bool qvar_combined_cmp( qvar_t q1, combined_t q2){  
+  return my_qvar_cmp(q1,(*q2)[0]); 
+}
+
+static $(comblist_t,stmt_opt_t) combine(catches_t c,nocatches_t nc){
+  let $(def,ret) = split_list(qvar_combined_cmp,default_case_qvar(),
+                              sum_catch(c),Core::heap_region); 
+  stmt_opt_t defstmt = (def==NULL)?NULL:((*def->hd)[1])->hd; 
+  //default handler
+  if( defstmt == NULL ) // uncaught exceptions (in catch pattern but inexhaustive)
+  //should be marked as trully uncaught if there is no handler
+  List::iter_c(set_nocatch_flag,nc,ret); // include no catch info
+  return $(ret,defstmt);
+}
+
+/****************************************************************
+ *  Constraint Generation API 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+
+static bool reentrant_type_visitor(string_t @ bad, type_t t) {
+  switch (t) {
+      //may containt `H so stop search (return false)
+       case &AppType(&AccessCon,_):
+       case &AppType(&CAccessCon,_): return false;
+       case &AppType(&HeapCon,_): 
+       case &AppType(&RefCntCon,_): 
+       case &AppType(&UniqueCon,_): 
+  		//	 case &AppType(&RgnsCon,_): //PG: Need this?
+	   *bad = aprintf("%s",Absynpp::typ2string(t));
+           return false;
+       default: return true;
+  }
+}
+
+static void check_reentrant(fenv_t fenv, Position::seg_t loc){
+ let ftyp = safe_cast(fenv_get_fd(fenv)->cached_type,
+                      "check_reentrant");
+ let $(_,_,_,_,_,_,_,reentrant0,_)= extract_fun_type_info(ftyp);
+ if(is_reentrant(reentrant0)){
+   string_t bad = "";
+   Absyn::visit_type(reentrant_type_visitor,&bad,ftyp);
+   if( strcmp(bad,"") != 0 ){ 
+    Tcutil::terr(loc,"Cannot use `H, `U, `RC in @re_entrant functions. Offending type : %s" ,bad);
+   }
+ }
+}
+
+static void check_access(fenv_t fe, Position::seg_t loc, 
+			  effect_t f,Absyn::type_opt_t t ){
+  // env_err("check_access: NOT IMPLEMENTED");  
+}
+
+/****************************************************************
+ *  Exception Analysis 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+// absyn_annot_t is an extensible data type and
+// should be one of the following:
+//  &InsertChecks::NoCheck, &InsertChecks::NullOnly,
+//  &InsertChecks::NullAndFatBound,
+//  &InsertChecks::FatBound,
+//  &InsertChecks::NullAndThinBound(e),
+//  &InsertChecks::ThinBound(e)
+
+// Add exceptions that may be generated from an expression
+// including exceptions generated by run-time checks
+// check whether they are caught and if not whether
+// the function spec agrees with the exn thrown
+// if caught register successor nodes of throwing node
+static void add_check_exception( env_t env,
+				 Absyn::exp_t e, 
+				 Absyn::absyn_annot_t annot ) {
+  if(!e->topt)
+   fprintf(stderr,"\nExpr : %s", Absynpp::exp2string(e));
+  let   old_typ = Tcutil::compress(safe_cast(e->topt,"add_check_exception"));
+  let fenv =  env_fenv(env);
+  int what = 0;
+//	printf("\nExpression : %s annotation : %s pointer type? %d\n",
+//				 Absynpp::exp2string(e),annot2string(annot),
+//				 Tcutil::is_pointer_type(old_typ));
+
+  switch(old_typ){
+    case &PointerType(PtrInfo{ta,tq,PtrAtts(_,nbl,b,zt,_)}):
+      switch(annot){
+       case &InsertChecks::NullOnly: 
+   	insert_null_check(fenv,e,"debug info: 1");
+	break;
+        // 0 = _check_known_subscript_notnull_e;
+         // 1 = _check_known_subscript_null_e;
+       case &InsertChecks::NullAndThinBound(bd): 
+	what=1;
+	fallthru(bd);
+       case &InsertChecks::ThinBound(bd):
+            let $(i,valid) = Evexp::eval_const_uint_exp(bd);
+      	    if(valid && i == 1 && 
+	      Tcutil::is_zeroterm_pointer_type(old_typ)){
+              if(!Toc::is_zero(bd)){
+      	         if( what == 1 )
+	           insert_array_bounds_null_check(fenv,e);
+              } else if( what == 0 )
+      	         insert_array_bounds_check(fenv,e);
+   	      else if( what == 1 )
+	          insert_array_bounds_null_check(fenv,e);
+            } else {  
+                if(what == 0 ) 
+                  insert_array_bounds_check(fenv,e);
+        	else if( what == 1 )
+                  insert_array_bounds_null_check(fenv,e);
+   	   }
+            break;
+       case &InsertChecks::NullAndFatBound: 
+            fallthru;
+	case &InsertChecks::FatBound:
+   	     insert_array_bounds_check(fenv,e);
+	     break;
+	default: 
+             break;
+    }
+    break;
+   default: 
+     break;
+  }
+  //	
+  switch(e->r) {
+        case &Throw_e(e1,...): 
+              add_exception(env,e,e1);	
+              break;
+  	 case &Malloc_e(_): 
+              fallthru;
+  	 case &New_e(_,_): 
+              if(throw_alloc)
+                 insert_badalloc_check(fenv,e); 
+              break;
+	 case &FnCall_e(e1,_,_,_,_):
+      	      if( Toc::do_null_check(e) ) 
+                insert_null_check(fenv,e,"debug info: 2");
+   	     type_t ftyp = safe_cast(e1->topt,"exp");
+             add_throws(env,fn_throw_annot(ftyp),e); 	
+             break;
+  	 case &Cast_e(new_typ,e1,user_inserted,coercion):
+	      type_t old_t2  = safe_cast(e1->topt,"add_check_exception");
+	      // type_t old_t2_c = Toc::typ_to_c(old_t2); //FIXME
+	      switch ($(Tcutil::compress(old_t2),Tcutil::compress(new_typ))){
+                case $(&Absyn::PointerType(p1),&Absyn::PointerType(p2)):
+	             let b1  = Tcutil::get_bounds_exp(bounds_one(),
+						    p1.ptr_atts.bounds);
+   	             let b2  = Tcutil::get_bounds_exp(bounds_one(),
+						    p2.ptr_atts.bounds);
+                   /*	printf("\nannotation : %s \n",
+                   		 annot2string(e->annot));
+   	    	   	printf("\nBounds : b1=%s b2=%s\n", b1!=NULL?
+                  		Absynpp::exp2string(b1):(string_t)"nil",
+      	          	 b2!=NULL?
+			Absynpp::exp2string(b2):(string_t)"nil");*/
+   	             switch($(b1,b2)){
+	                case $(&_, &_):
+   	    	             if(Toc::do_null_check(e)) 
+                                insert_null_check(fenv,e,"debug info: 3");
+   	    	  	     break;
+      	                case $(NULL, &_): 
+      	                     if(Toc::do_null_check(e)) 
+                               insert_null_check(fenv,e,"debug info: 4");
+			     break;
+      	                default: 
+                             break;
+	              }
+	              break;
+   	       default: break;
+	    }
+	    break;
+        case &Increment_e(e2,incr): 
+             type_t elt_typ = void_type;
+	     if( is_tagged_union_project(e2))	
+               fallthru(e2,NULL);
+	     else 
+		 if( !Tcutil::is_fat_pointer_type_elt(old_typ,&elt_typ) &&
+    		  Tcutil::is_zero_pointer_type_elt(old_typ,&elt_typ) && 
+			 ( incr != Absyn::PostInc )
+		   )
+	  		 insert_array_bounds_check(fenv,e2);
+	    break;
+  	case &AssignOp_e(e1,popt,_):
+	    if (is_tagged_union_project(e1) && popt != NULL )
+		insert_match_check(fenv,e1);
+	    break;
+             if (is_zero_ptr_deref(e1)) 
+ 	        insert_array_bounds_check(fenv,e1);
+             break;
+
+        case &AggrMember_e(e1,_,is_tagged,is_read): 
+	     fallthru(e1,is_tagged,is_read);
+        case &AggrArrow_e(e1,_,is_tagged,is_read):
+ 	     if (is_tagged && is_read ) 
+               insert_match_check(fenv,e1);
+             break;  
+        default: 
+             break;
+  }
+}
+
+/****************************************************************
+ *  Constraint API 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+
+static string_t con2string(con_t c) {
+  switch(c) {
+   case &Access(ac,rgn,_):
+        let r = Absynpp::typ2string(rgn);
+        switch(ac){
+          case Live:
+            return aprintf("Live(%s)",r);
+          case Wr:
+            return aprintf("Write(%s)",r);
+          case Rd:
+           return aprintf("Read(%s)",r);
+          case Not_Live:
+           return aprintf("Not_Live(%s)",r);
+          case Not_RW:
+           return aprintf("Not_RW(%s)",r);
+          case Not_W:
+           return aprintf("Not_W(%s)",r);
+          default:
+           env_err("con2string");
+        }
+   case &Cap(rcnt,wrcnt,rdcnt,rgn,_):
+        let r = Absynpp::typ2string(rgn);
+        return aprintf("Cap(%s,%d,%d,%d)",r,rcnt,
+                        wrcnt,rdcnt);
+   case &Join(c0,c1,_):
+        return aprintf("Join( (%s)  ?  (%s))",
+                        cons2string(c0),cons2string(c1));
+      /*  if(!cons || !cons->tl) 
+          env_err("con2string: Join must have at least 2 elts."); 
+        let ret = aprintf("(%s)",cons2string(cons->hd));
+        for(cons=cons->tl;cons;cons=cons->tl)
+           ret = aprintf("%s ? (%s)",ret,
+                         cons2string(cons->hd));
+        return aprintf("Join(%s)",ret);*/
+   case &Spawn(c1,cons,_):
+         string_t s = "";
+         for(_ iter=c1,c1=NULL;iter;iter=iter->tl)
+           switch(iter->hd) {
+            case &Cap(a,b,c,r,loc):
+                 if(strcmp(s,""))
+                  s = aprintf("$(%s,%d,%d,%d),%s",
+                      Absynpp::typ2string(r),
+                      a,b,c,s);
+                 else
+                  s = aprintf("$(%s,%d,%d,%d)",
+                      Absynpp::typ2string(r),
+                      a,b,c);
+                break;
+          default:
+                 env_err("cons2string: Spawn");
+         }
+        return aprintf("{Spawn (%s) (%s)}",
+                        s, cons2string(cons));
+
+   case &Call(c0,_,s):
+        return aprintf("Call (fun=%s,%s)",
+                        s,cons2string(c0));
+   case &Empty:
+        return "Empty";
+   case &Undefined:
+        return "Undefined";
+  }
+} 
+
+static string_t cons2string(cons_t cons) {
+  return Absyn::list2string(cons,con2string);
+}
+
+static bool cons_is_empty(cons_t c ){
+  if( c == &empty_cons ) return true;
+  switch(c){
+    case &List{.hd=&Empty,.tl=NULL}: 
+         return true;
+    default:
+         return false;
+  }
+}
+
+static bool cons_is_undefined(cons_t c ){
+  if( c == &undef_cons ) return true;
+  switch(c){
+    case &List{.hd=&Undefined,.tl=NULL}: 
+         return true;
+    default:
+         return false;
+  }
+}
+
+static con_t copy_con(con_t c) {
+  if( c == &Undefined_val ) return c;
+  if( c == &Empty_val ) return c;
+  else switch(c) {
+    case &Empty:
+         return &Empty_val;
+    case &Undefined:
+         return &Undefined_val;
+    default:
+         return c;
+  }
+}
+
+static cons_t copy_cons(cons_t c) {
+  if( cons_is_undefined(c) ) return &undef_cons;
+  if( cons_is_empty(c) ) return &empty_cons;
+  return List::copy(c);
+}
+
+static cons_t cons_merge(cons_t c0, cons_t c1,seg_t loc) {
+  if( cons_is_undefined(c1) ) 
+    env_err("cons_merge: undefined c1");
+  else if( cons_is_undefined(c0) )
+    return copy_cons(c1); 
+  else if( cons_is_empty(c0) && cons_is_empty(c1) )
+    return &empty_cons;
+  else {
+    let c01 = copy_cons(c0);
+    let c11 = copy_cons(c1);
+    let ret = cons_singleton(new Join(c01,c11,loc));
+     return cons_prefix(ret);
+   // return ret;
+   }
+}
+
+static cons_t cons_append(cons_t c0, cons_t c1) {
+  if( cons_is_undefined(c1) ) 
+    env_err("cons_append: undefined c1");
+  else if( cons_is_undefined(c0) || cons_is_empty(c0) )
+    return copy_cons(c1); 
+ else if( cons_is_empty(c1) )
+    return copy_cons(c0);
+ else
+    return List::imp_append(copy_cons(c0),copy_cons(c1));
+}
+
+static cons_t cons_singleton(con_t c) {
+  return new List(c,NULL);
+}
+
+static con_t con_empty() { 
+   return &Empty_val; }
+
+static cons_t cons_empty() {
+   return &empty_cons; }
+
+static con_t con_undefined() {
+   return &Undefined_val; }
+
+static cons_t cons_undefined() { 
+   return &undef_cons; 
+}
+
+static Set::set_t<type_t> xrgns_of_cons(cons_t c){
+  let x = Set::empty(cmptypes);
+  bool isemp = true; 
+  for(;c;c=c->tl) {
+    let emp21 = Set::is_empty(x);
+    switch(c->hd) {
+    case &Access(_,r,_):
+         fallthru(r);
+    case &Cap(_,_,_,r,_):
+         x =Set::insert(x,r);
+         let emp22 = Set::is_empty(x);
+         if(emp22)
+          env_err("xrgns_of_cons 3");
+         isemp = false;
+         break;
+    case &Call(c1,_,_):
+         fallthru(c1,NULL);
+    case &Join(c1,c2,_): 
+         fallthru(c1,c2);
+    case &Spawn(c1,c2,_):
+         x = Set::union_two(x,
+             Set::union_two(xrgns_of_cons(c1),
+                            xrgns_of_cons(c2)));
+         let emp22 = Set::is_empty(x);
+         if(!emp21 && emp22)
+          env_err("xrgns_of_cons 4");
+         if(isemp) isemp = emp22;
+         break;
+    case &Empty:
+    case &Undefined:
+         break;
+  }
+     let emp2 = Set::is_empty(x);
+     if(isemp == false && emp2 == true)
+       env_err("xrgns_of_cons zzz: %s",con2string(c->hd));
+  }
+  let emp2 = Set::is_empty(x);
+  if(isemp == false && emp2 == true)
+    env_err("xrgns_of_cons");
+  return x;
+}
+
+static bool con_eq(con_t c0, con_t c1){
+  switch($(c0,c1)) {
+    case $(&Access(a1,r1,l1),&Access(a2,r2,l2)):
+         return l1 == l2;
+         // (a1==a2) && (l1==l2) && (!cmptypes(r1,r2));
+   case  $(&Cap(a1,b1,c1,r1,l1),&Cap(a2,b2,c2,r2,l2)):
+         return l1==l2;//(a1==a2) && (b1==b2) &&(c1==c2) &&
+                //(l1==l2) && (!cmptypes(r1,r2));
+   case $(&Join(c1a,c1b,l1),&Join(c2a,c2b,l2)):
+        return cons_eq(c1a,c2a) && cons_eq(c1b,c2b);
+   case $(&Call(c1a,l1,_),&Call(c2a,l2,_)):
+        return l1 == l2; //cons_eq(c1a,c2a) && l1 == l2;
+   case $(&Empty,&Empty):
+        return true;
+   case $(&Undefined,&Undefined):
+        return true;
+   case  $(&Spawn(_,_,l1),&Spawn(_,_,l2)):
+         return l1 == l2;
+   default:
+        return false;
+  }
+}
+
+static bool cons_eq(cons_t c0, cons_t c1) {
+  for(;c0 && c1 && con_eq(c1->hd,c0->hd);
+       c0=c0->tl,c1=c1->tl);
+  return !c0 && !c1;
+}
+
+static cons_t cons_prefix(cons_t c ){
+  cons_t hd = NULL;
+  for(;c;c=c->tl) switch(c->hd) {
+    case &Join(c1,c2,l):
+         let $(a,b) = $(cons_prefix(c1),
+                       cons_prefix(c2));
+         cons_t pre = NULL;
+         for(;a && b && con_eq(a->hd,b->hd);
+             a=a->tl,b=b->tl) 
+            pre = new List(a->hd,pre);
+         if(pre) {
+             // fprintf(stderr,"\n\n@@@@@: of c1=%s"
+            //         " and c2=%s is c3=%s\n\n",
+            //      cons2string(c1),cons2string(c2),
+            //      cons2string(List::rev(pre)));
+           let iter = pre;
+           for(;iter->tl; iter=iter->tl);
+           iter->tl = hd;
+           hd = pre;
+         }
+         if(a || b ) {
+            if(!a) a = cons_empty();
+            if(!b) b = cons_empty();
+            con_t j = new Join(copy_cons(a),
+                               copy_cons(b),l);
+         //printf(stderr,"Remaining: %s\n\n",con2string(j));
+            hd = new List(j,hd);
+         }
+         break;
+    default:
+         hd = new List(c->hd,hd);
+         break; 
+  }
+  return List::rev(hd);
+}
+/*
+static cons_t cons_prefix(cons_t c ){
+  cons_t hd = c;
+  cons_t prev = NULL;
+  for(;c;prev=c,c=c->tl) switch(c->hd) {
+    case &Spawn(_,*c2,_):
+         //fallthru(c2);
+         break;
+    case &Call(*c1,_,_):
+         //*c1 = cons_prefix(*c1);
+         //fallthru;
+         break;
+    case &Access(_,_,_):
+         fallthru;
+    case &Cap(_,_,_,_,_):
+         fallthru;
+    case &Empty:
+         fallthru;
+    case &Undefined:
+         break; 
+    case &Join(*c1,*c2,_):
+         let a = cons_prefix(*c1);
+         let b = cons_prefix(*c2);
+         let d = a;
+         let e = NULL;
+         //
+         for(;a && b && con_eq(a->hd,b->hd);
+              e=a,a=a->tl,b=b->tl);
+         bool empty = !a && !b;
+         if(!empty){
+          *c1 = a;
+          *c2 = b;
+         }
+         let l = NULL;
+         if(e) {
+      
+            let tmp = e->tl;
+            e->tl = NULL;
+            let l = List::copy(d);
+            e->tl = tmp;
+
+            if(!prev){
+               let tl = hd;
+               if(empty) tl = hd->tl;
+               e->tl = tl;
+               hd = d;
+            } else {
+              let tl = c;
+              if(empty) tl = c->tl;
+              e->tl = tl;
+              prev->tl = d;
+            }
+         }
+         //fprintf(stderr,"\nCommon cons_prefix of \"%s\" is \"%s\"\n",
+         //         con2string(c->hd), cons2string(l));
+         break;
+  }
+  return hd;
+}
+*/
+/****************************************************************
+ * Control-flow Graph Construction API 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+static $(nlist_t,nlist_t,bool)
+       concfg_e(env_t env,exp_t e,nlist_t left) {
+   let fenv = env_fenv(env); 
+   let n = get_exp(fenv,e);
+
+   set_node_id(n);
+
+   push_annot(env,e->annot);
+   node_set_enclosing_xrgn(n,enclosing_xrgns(fenv));
+
+   let $(a,b,c) = _concfg_e(env,e,left);
+   pop_annot(env);
+   //check once sub expr have been checked
+   // Add exceptions that may be generated from an expression
+   // including exceptions generated by run-time checks
+   // check whether they are caught and if not whether
+   // the function spec agrees with the exn thrown
+   // if caught register successor nodes of throwing node
+   add_check_exception(env,e,peek_annot(env)); 
+   return $(a,b,c);
+}
+
+// accept left-most node, return left-most node
+static $(nlist_t,nlist_t,bool)
+       _concfg_e(env_t env,exp_t e,nlist_t left) {
+  let fenv = env_fenv(env);
+  // obtain the node for this expression 
+  let n = get_exp(fenv,e);
+  let nl = nsig(n); 
+  let le = NULL;
+  switch(e->r) {
+    case &Enum_e(...):  
+         fallthru;
+    case &AnonEnum_e(...):  
+         fallthru;
+    case &Valueof_e(_): 
+         fallthru;
+    case &Asm_e(...):  
+         fallthru;
+    case &Extension_e(_):  
+         fallthru;
+    case &Const_e(_): 
+         fallthru;
+    case &Sizeoftype_e(_): 
+         fallthru;
+    case &Offsetof_e(_,_): 
+         fallthru;
+    case &Var_e(_):  
+         fallthru;
+    case &Pragma_e(_):
+         break;
+    case &StmtExp_e(s0):
+         add_succs(n,left,"concfg_e: StmtExp_e.");
+         return concfg_s(env,s0,nsig(n));
+    case &Tuple_e(le0): 
+         fallthru(le0);
+    case &Datatype_e(le0,_,_): 
+         fallthru(le0);
+    case &Primop_e(_,le0):
+         le = le0;
+         break;
+    case &AnonStruct_e(_,le0):
+         fallthru(le0);
+    case &Aggregate_e(_,_,le0,_): 
+         fallthru(le0);
+    case &Array_e(le0): 
+         fallthru(le0);
+    case &CompoundLit_e(_,le0):
+         if(!le0) break;
+         le = new List((*le0->hd)[1],0);
+         let tl = le;
+         for(le0=le0->tl; le0 ; le0=le0->tl,tl=tl->tl)
+            tl->tl = new List((*le0->hd)[1],0);
+         break;
+    case &Subscript_e(e1,e2): 
+         fallthru(e1,e2);
+    case &AssignOp_e(e1,_,e2): 
+         fallthru(e1,e2);
+    case &Swap_e(e1,e2):  
+         fallthru(e1,e2);
+    case &SeqExp_e(e1,e2):
+         fallthru(e1,e2);
+    case &Comprehension_e(_,e1,e2,_):  
+         //fallthru(e1,e2);
+         le = new List(e1,new List(e2,0));
+         break;
+    case &ComprehensionNoinit_e(e1,_,_): 
+         fallthru(e1);
+    case &AggrArrow_e(e1,_,_,_): 
+         fallthru(e1);
+    case &Deref_e(e1):
+         fallthru(e1);
+    case &Tagcheck_e(e1,_):
+         fallthru(e1);
+    case &Instantiate_e(e1,_): 
+         fallthru(e1);
+    case &Cast_e(_,e1,_,_): 
+         fallthru(e1);
+    case &Sizeofexp_e(e1): 
+         fallthru(e1);
+    case &Increment_e(e1,_): 
+         fallthru(e1);
+    case &NoInstantiate_e(e1): 
+         fallthru(e1);
+    case &AggrMember_e(e1,_,_,_): 
+         fallthru(e1);
+    case &Address_e(e1):
+         le = new List(e1,0);
+         break;
+    case &Malloc_e(m):
+         fallthru(m.rgn,m.num_elts);
+    case &New_e(eopt,e1):
+         le = new(eopt?List(eopt,new List(e1,0)):
+                       List(e1,0));
+         break;
+    case &FnCall_e(e1,le0,_,_,_):
+         le = new List(e1,le0);
+         break;
+    case &Or_e(e1,e2): 			 
+         fallthru(e1,e2); 
+    case &And_e(e1,e2): 		
+         add_succs(n,left,"concfg_s: And_e/Or_e"); 
+         let $(left2,right2,j2)=concfg_e(env,e2,nl);
+         let both1 = append_unique(left2,nl);
+         let $(left1,right1,j1)=concfg_e(env,e1,both1);
+         if(j1) return $(left1,right1,true);
+         return $(left1,right2,j2);
+    case &Conditional_e(e1,e2,e3):
+         add_succs(n,left,"concfg_s: Conditional_e"); 
+         let $(left3,right3,j3)=concfg_e(env,e3,nl);
+         let $(left2,right2,j2)=concfg_e(env,e2,nl);
+         let both1 = append_unique(left3,left2);
+         let $(left1,right1,j1)=concfg_e(env,e1,both1);
+         if(j1) return $(left1,right1,true);
+         return $(left1,append_unique(right3,right2),j2&&j3);
+    case &Throw_e(e0,_): 
+         let nl = nsig(n);
+         let $(left0,right0,j2)=concfg_e(env,e0,nl);
+         if(j2) return $(left0,right0,true);
+         return $(left0,nl,true); //right-most node
+    case &UnresolvedMem_e(...): 
+         env_err("concfg_e: UnresolvedMem_e"); 
+  }
+  add_succs(n,left,"concfg_s: lists 1"); 
+  let left_l= nl; 
+  let right_l= left; 
+  let j = false;
+  //printf("\nTerm: %s list size = %d le NULL ? %d\n" ,
+   //       node2string(n),List::length(le),!le);
+  for(_ r =r = List::rev(le);r;r=r->tl) {
+     let $(left1,right1,j1)=concfg_e(env,r->hd,left_l);
+     j = j || j1; 
+     left_l = left1;
+     if(j1) right_l = right1;
+  }
+  return $(left_l,right_l,j);
+}
+
+static $(nlist_t,nlist_t,bool) // bool->rightmost jump
+      concfg_s(env_t env,stmt_t s,nlist_t left) {
+  // if this is a jump-like statement then 
+  // register its successor
+  // doesn't handle exceptions
+  //register_stmt_succ(env,s); 
+  // store the annotation related to this statement
+  push_annot(env,s->annot);
+  // obtain the node for this statement
+  let fenv = env_fenv(env);
+  let n = get_stmt(fenv,s);
+
+  set_node_id(n);
+
+  //fprintf(stderr,"\nID FOR : %s", node2string(n));
+
+  node_set_enclosing_xrgn(n,enclosing_xrgns(fenv));
+  switch(s->r) {
+      //inner declaration
+      case &Decl_s(&Decl{.r=&Fn_d(fd),...},_): 
+           analyze_fd(env_genv(env),fd); 
+           break;
+     case  &Decl_s(d,_): 
+           switch(d->r){
+             case &Region_d(tv,_,eo):
+                  if(is_xrgn_tvar(tv)) {
+                     push_enclosing_xrgn(fenv,
+                                         stmt2decl(s));
+                  }
+                  break;
+             default:
+                  break;
+           }
+           break;
+     default: 
+           break;
+  }
+  let $(a,b,c) = _concfg_s(env,s,left);
+  env_update_pred_succs(env,s,a);
+ // if(pop_xrgn)
+  //  pop_enclosing_xrgn(fenv);
+ pop_annot(env);
+ return $(a,b,c);
+}
+
+static bool node_is_jump(node_t n) { 
+  switch(n->n) {
+    case &Stmt(s): 
+         switch(s->r) {
+     	  case &Break_s:  
+              fallthru;
+	  case &Continue_s: 
+               fallthru;
+	  case &Goto_s(_):
+               fallthru;
+          case &Fallthru_s(_,_): 
+ 	  case &Return_s(_): 
+               return true;
+          default:
+               return false;
+         }
+    case &Exp(e):
+         switch(e->r) {
+          case &Throw_e(_,_):
+               return true;
+          default:
+               return false;
+         }
+    default: 
+         return false;
+  }
+}
+
+static void add_nojump_succs(fenv_t fenv,node_t nskip,nlist_t right1) {
+  for(_ iter=right1; iter ; iter=iter->tl) {
+      let n = iter->hd;
+      if(!node_is_jump(n))
+        add_succ(n,nskip,"add_no_jump_succs"); 
+  }
+}
+ 
+
+static $(nlist_t,nlist_t,bool) // bool->rightmost jump
+      _concfg_s(env_t env,stmt_t s,nlist_t left) {
+   let fenv = env_fenv(env);
+   let n = get_stmt(fenv,s);
+   switch(s->r) {
+          case &Break_s:  
+               fallthru;
+          case &Continue_s: 
+               fallthru;
+          case &Goto_s(_): 
+               let nl = nsig(n);
+               //FIXME: Left here should be destinations of jumps
+               // Not NL !!
+               return $(nl,nl,true); //right-most node
+          case &Return_s(e0):
+               let nexit =  get_stmt(fenv,exit_stmt(fenv));
+               add_succ(n,nexit,"concfg_s Return_s 0");
+               let nl = nsig(n);
+               if(!e0) return $(nl,nl,true);
+               return concfg_e(env,e0,nl);
+          case &Label_s(_,s0):
+              // add_succs(n,left,"concfg_s Label_s 0");
+               //  return concfg_s(env,s0,nsig(n));
+              let $(a,b,c) = concfg_s(env,s0,left);
+              return $(a,b,c);
+          case &Exp_s(e0):
+               add_succs(n,left,"concfg_s Exp_s 0");
+               return concfg_e(env,e0,nsig(n));
+
+          case &Skip_s:
+               add_succs(n,left,"concfg_s Skip_s 0");
+               return $(nsig(n),left,false);
+
+          case &Seq_s(s1,s2):
+               //add_succs(n,left,"concfg_s Seq_s 0"); 
+               let $(left2,right2,j2) = concfg_s(env,s2,left);//nsig(n));
+               let $(left1,right1,j1) = concfg_s(env,s1,left2);
+               if(j1) return $(left1,right1,true);
+               return $(left1,right2,j2);
+
+         case &Fallthru_s(el,sc):
+              if(!sc) env_err("concfg_s Fallthru_s"); 
+	      let s2 = (*sc)->body;
+              // FIXME: left here should be left_of_s2
+              // but we know that s2 has a brake statement so
+              // we don't care about the left
+              // we could memoize left and rights so as to avoid
+              // recomputation of all cases
+              let $(left2,right2,j2)=concfg_s(env,s2,NULL);
+              let r = List::rev(el); // go backwards
+              let nl = nsig(n);
+              add_succs(n,left2,"concfg_s Fallthru_s 0"); 
+              for(left2=nl;r;r=r->tl) {
+                 let $(left3,right3,j3)=concfg_e(env,r->hd,left2);                          if(j3) 
+                   right2 = right3;  
+                left2 = left3;
+              }
+              return $(left2,right2,true);
+       case &Spawn_s(es0,e0,es1):
+            let l1  = List::copy(es0);
+            let l3  = List::copy(es1);
+            let l2  = new List(e0,0);
+            fallthru(List::append(List::append(l1,l2),l3));
+         case &Cap_s(el):
+              add_succs(n,left,"concfg_s Cap_s 0"); 
+              let r = List::rev(el); // go backwards
+              let left2 = nsig(n);
+              let right2 = left2;
+              let j = false;
+              for(;r;r=r->tl) {
+                let $(left3,right3,j3)=concfg_e(env,r->hd,left2);
+                if(j3) {
+                  right2 = right3;  
+                  j = true;
+                }
+                left2 = left3;
+              }
+              return $(left2,right2,j);
+         case &Switch_s(e0,scs,_):
+             let r0 = List::rev(scs);
+             let r = r0;
+             let nl = left; //nsig(n); 
+             //add_succs(n,left,"concfg_s Switch_s 0"); 
+             let left_l= NULL; 
+             let right_l= NULL; 
+             for(;r;r=r->tl) {
+                let sc = r->hd;
+                let s1 = sc->body;
+		          let pat = sc->pattern;
+                let $(left1,right1,_)=concfg_s(env,s1,nl);
+                let npat = get_pat(fenv,pat,sc->loc);
+                
+               node_set_enclosing_xrgn(npat,
+                           enclosing_xrgns(fenv));
+                add_succs(npat,left1,"concfg_s Switch_s 0"); 
+                left1 = nsig(npat);
+                left_l = append_unique(left_l,left1);
+                right_l = append_unique(right_l,right1);
+             }
+             
+             //set ids
+             for(r=r0;r;r=r->tl) {
+                 let sc = r->hd;
+		           let pat = sc->pattern;
+                 let npat = get_pat(fenv,pat,sc->loc);
+                 set_node_id(npat);
+             }
+             
+             let $(left0,right0,j2) = concfg_e(env,e0,left_l);
+
+             if(j2) return $(left0,right0,true);
+             return $(left0,right_l,false);
+
+         case &IfThenElse_s(e0,s1,s2):
+             // add_succs(n,left,"concfg_s IfTheElse_s 0"); 
+              let nl = left; //nsig(n); 
+              let $(left1,right1,j1) = concfg_s(env,s1,nl);
+              let $(left2,right2,j2) = concfg_s(env,s2,nl);
+              left1 = append_unique(left1,left2);
+              let $(left3,right3,j3) = concfg_e(env,e0,left1);
+              if(j2) return $(left3,right2,true);
+              right1 = append_unique(right1,right2);
+              return $(left3,right1,j1&&j2);
+              
+         case &TryCatch_s(s0,scs,dtp0): 
+              //add_succs(n,left,"concfg_s TryCatch_s 0");
+             let r0 = List::rev(scs);
+             let r = r0;
+             let nl = left; //nsig(n); 
+             //add_succs(n,left,"concfg_s Switch_s 0"); 
+             for(;r;r=r->tl) {
+                let sc = r->hd;
+                let s1 = sc->body;
+		          let pat = sc->pattern;
+                let $(left1,right1,_)=concfg_s(env,s1,nl);
+                let npat = get_pat(fenv,pat,sc->loc);
+
+                set_node_id(npat);
+
+                node_set_enclosing_xrgn(npat,
+                           enclosing_xrgns(fenv));
+
+                //printf("\nSuccessors of PATTERN: %s (%p) \n",
+                  //    node2string(npat), npat);
+                //for( _ iter = left1 ; iter ; iter = iter->tl )
+                 // printf("\n-------->\t%s",node2string(iter->hd));
+                //printf("\nEND Successors of PATTERN: %s\n", node2string(npat));
+                add_succs(npat,left1,"concfg_s TryCatch_s 0"); 
+             }
+
+             //set ids
+             for(r=r0;r;r=r->tl) {
+                 let sc = r->hd;
+	        let pat = sc->pattern;
+                let npat = get_pat(fenv,pat,sc->loc);
+                set_node_id(npat);
+             }
+
+	    //begin catch block
+   	     let dtp = safe_cast(dtp0,"concfg_s");
+   	     push_catch_block(fenv,s0,dtp,scs);
+             let ret = concfg_s(env,s0,left);
+   	     pop_catch_block(fenv);
+             return ret;
+
+         case &Decl_s(d,s2):
+              //add_succs(n,left,"concfg_s Decl_s 0"); 
+              //let nl = nsig(n); 
+              let $(left2,right2,j2) = concfg_s(env,s2,left);
+              let eo1 = NULL;
+              let n_pat = NULL;
+              let is_xrgn = false;
+              let n_decl = get_decl(fenv,d);
+              set_node_id(n_decl);
+              switch(d->r) {
+                case &Region_d(tv,_,eo):
+                    if(Absyn::is_xrgn_tvar(tv))
+       	              pop_enclosing_xrgn(fenv);
+                    eo1 = eo;
+                    break;
+                case &Var_d(vdecl):
+                     let e0 = vdecl->initializer;
+                     eo1 = e0;
+                     break;
+                case &Let_d(pat1,_,e0,_):
+                     eo1 = e0;
+                     n_pat = get_pat(fenv,pat1,d->loc);
+                     set_node_id(n_pat);
+                     node_set_enclosing_xrgn(n_pat,
+                           enclosing_xrgns(fenv));
+                     break; 
+                default:
+                     break;
+            }
+
+            node_set_enclosing_xrgn(n_decl,
+                           enclosing_xrgns(fenv));
+            add_succs(n_decl,left2,"concfg_s Decl_s n_decl"); 
+            left2 = nsig(n_decl);
+            if(eo1) {
+              if(n_pat) {
+               //add_succs(n_pat,left1,"concfg_s Decl_s n_pat"); 
+               //left1 = nsig(n_pat);
+               add_succs(n_pat,left2,"concfg_s Decl_s n_pat"); 
+               left2 = nsig(n_pat);
+              }
+              let $(left1,right1,j1) = concfg_e(env,eo1,left2);
+              if(j1) return $(left1,right1,true);
+              return $(left1,right2,j2);
+            } else 
+              return $(left2,right2,j2);
+            break;
+
+	case &For_s(e1,$(e2,_),$(e3,skip),s1):
+             let nskip = get_stmt(fenv,skip);
+             //add_succs(n,left,"concfg_s For_s"); 
+             let nl = left; //nsig(n); 
+             let $(left1,right1,j1) = concfg_s(env,s1,nl);
+             let $(left3,right3,j3) = concfg_e(env,e3,left1);
+              // backwards flow to e2 can be from e3, s1 or succ(For_s)
+             let left_x = append_unique(append_unique(left3,left1),nl);
+             let $(left2,right2,j2) = concfg_e(env,e2,left_x);
+             let $(left4,right4,j4) = concfg_s(env,skip,left2);
+             let $(left5,right5,j5) = concfg_e(env,e1,left4);
+             //
+             if(j5) return $(left5,right5,true);
+             if(j2) return $(left5,right2,true);
+             add_nojump_succs(fenv,nskip,right1);
+             return $(left5,right1,false);
+
+        case &While_s($(e,skip),s1):
+             let nskip = get_stmt(fenv,skip);
+             //add_succs(n,left,"concfg_s While_s"); 
+             let nl = left; //nsig(n); 
+             let $(left1,right1,j1) = concfg_s(env,s1,nl);
+             left1 = append_unique(left1,nl);         
+             let $(left2,right2,_) = concfg_s(env,skip,left1);
+             let $(left3,right3,j3) = concfg_e(env,e,left2);
+             if(j3) return $(left3,right3,true);
+             add_nojump_succs(fenv,nskip,right1);
+             return $(left3,right1,false);
+ 
+	case &Do_s(s1,$(e,skip)):
+             let nskip = get_stmt(fenv,skip);
+             //add_succs(n,left,"concfg_s While_s"); 
+             let nl = left; //nsig(n); 
+             let $(left1,right1,j1) = concfg_e(env,e,nl);
+             let $(left2,right2,j2) = concfg_s(env,skip,left1);
+             let $(left3,right3,j3) = concfg_s(env,s1,left2);
+             if(j3) return $(left3,right3,true);
+             if(!j1) 
+               add_succs(get_exp(fenv,e),left3,"concfg_s While_s"); 
+             //for(_ iter=right1; iter ; iter=iter->tl)
+             //   add_nojump_succs(fenv,iter->hd,left3);
+             return $(left3,right1,j1);
+   }
+}
+
+/****************************************************************
+ *  Constraint Gathering API 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+ static datatype Type.TupleType  no_parent_tval =  TupleType(NULL);
+ type_t no_parent = &no_parent_tval;
+ static datatype Type.TupleType  root_tval =  TupleType(NULL);
+ type_t root = &root_tval;
+///////////////////////////////////////////////////////////////////
+
+typedef $(int,int,int) @ `H xcap_t, * `H xcap_opt_t;
+typedef Hashtable::table_t<type_t,type_opt_t> rgnpar_t;
+typedef Hashtable::table_t<type_t,list_t<type_t,`H>> 
+        pargn_t;
+
+typedef Hashtable::table_t<type_t,xcap_t> xcaps_t;
+typedef xcap_t (@`H xcap_clone_t)(xcap_t); 
+typedef bool (@`H xcap_cmp_t)(xcap_t,xcap_t); 
+
+static string_t xregion2string(type_t r) {
+  if( r == no_parent ) return "NoParent";
+  if( r == root ) return "Root";
+  return Absynpp::typ2string(r);
+}
+
+static xcaps_t new_xcaps();
+
+/// ParRgn API
+static pargn_t new_pargn() {
+  return Hashtable::create(33,cmptypes,hash_type);
+}
+
+
+///////////////////////////////////////////////////////////////
+/// Rgn par API
+///////////////////////////////////////////////////////////////
+
+static rgnpar_t new_rgnpar() {
+  return Hashtable::create(33,cmptypes,hash_type);
+}
+
+static type_t parent_of(rgnpar_t p , type_t r) {
+   
+   switch(Hashtable::lookup_opt(p,r)){ 
+     case NULL:
+          return no_parent;
+     case &opt:
+          if(opt) return opt;      
+          else return root;
+   }
+}
+
+static rgnpar_t decls2rgns(list_t<decl_t,`H>  it2){
+   rgnpar_t ret = new_rgnpar();
+   for(;it2;it2=it2->tl) switch(it2->hd){ 
+      case &Decl{.r=&Region_d(tv,_,eo),...}:
+           let l = xrgns_of(eo->topt);
+           type_opt_t tpar =NULL;
+           if(l) tpar = l->hd;
+           Hashtable::insert(ret,new VarType(tv),tpar);
+           break;
+      default:
+           env_err("decls2rgns");
+   }
+   return ret;
+}
+
+static types_t decls2order(list_t<decl_t,`H>  it2){
+   types_t ret = NULL;
+   for(;it2;it2=it2->tl) switch(it2->hd){ 
+      case &Decl{.r=&Region_d(tv,_,eo),...}:
+           ret = new List(new VarType(tv),ret);
+           break;
+      default:
+           env_err("decls2order");
+   }
+   return List::rev(ret);
+}
+
+static list_t<decl_t,`H> 
+   node_diff_enclosing_xrgn(node_t from,node_t to) {
+   let it1 = from->enclosing_xrgn;
+   let it2 = to->enclosing_xrgn;
+   let $(l1,l2) = $(List::length(it1),List::length(it2));
+   if(l1 <= l2) return NULL;
+   /*string_t s0 = Absyn::list2string(it1,Absynpp::typ2string);
+   string_t s1 = Absyn::list2string(it2,Absynpp::typ2string);
+   fprintf(stderr,"\nNode(from): %s\nNode(to): %s:"
+                  " it1=%s it2=%s", node2string(from),
+                  node2string(to), s0,s1);*/
+   for(;l2;l2--,it1=it1->tl);
+   return it1; //new decls2rgns(it1);
+}
+
+static void rgnpar2string_iter(type_t k,type_opt_t t,string_t *s) {
+  let p = t?Absynpp::typ2string(t):"_";
+  let c = Absynpp::typ2string(k);
+  if(!strcmp(*s,""))
+    *s = (string_t) aprintf("%s ,(%s,%s)",*s,c,p);
+  else
+    *s = (string_t) aprintf("(%s,%s)",c,p);
+}
+
+static string_t rgnpar2string( rgnpar_t p ) {
+  string_t s = "";
+  Hashtable::iter_c(rgnpar2string_iter,p,&s);
+  return s;
+}
+
+static void rgnpar2xcaps_iter(type_t k,
+                     type_opt_t t,xcaps_t x) {
+  Hashtable::insert(x,k,new $(1,1,0));
+}
+
+static xcaps_t rgnpar2xcaps(rgnpar_t p ) {
+  let x = new_xcaps();
+  Hashtable::iter_c(rgnpar2xcaps_iter,p,x);
+  return x;
+}
+
+///////////////////////////////////////////////////////////////
+/// XCaps API
+///////////////////////////////////////////////////////////////
+
+static string_t xcap2string(xcap_t x ){
+  let &$(a,b,c) = x;
+  return (string_t) aprintf("(%d,%d,%d)",a,b,c);
+}
+
+static bool xcap_eq(xcap_t v, xcap_t v0) {
+  let &$(a0,a1,a2) = v;
+  let &$(b0,b1,b2) = v0;
+  return (a0 == b0 && a1 == b1 && a2 == b2);
+}
+
+static void ht_iter_eq(type_t k,xcap_t v,$(xcaps_t,bool @`r) @`H e0) {
+  let &$(e,b) = e0;
+  if(!(*b)) return;
+  switch(Hashtable::lookup_opt(e,k)){
+    case NULL:
+         *b = false;
+         break;
+    case &v0:
+         let &$(a0,a1,a2) = v;
+         let &$(b0,b1,b2) = v0;
+         *b = (a0 == b0 && a1 == b1 && a2 == b2);
+         break; 
+  }
+}
+
+static bool ht_eq(xcaps_t ht1,xcaps_t ht2) {
+   let b = true;
+   Hashtable::iter_c(ht_iter_eq,ht1,new $(ht2,&b));
+   return b; 
+}
+
+static xcaps_t new_xcaps() {
+  return Hashtable::create
+         (33,cmptypes,hash_type);
+}
+
+static void ht_iter_clone(type_t k,xcap_t v,xcaps_t e ) {  
+   Hashtable::insert(e,k,new *v);
+}
+
+static xcaps_t ht_clone(xcaps_t ht) {
+  let e = new_xcaps();
+  Hashtable::iter_c(ht_iter_clone,ht,e);
+  return e; 
+}
+
+static void xcaps_zero(type_t r,xcap_t t, $(seg_t,seg_t) @`H locs){
+  let &$(a,b,c) = t;
+  let &$(loc1,loc2) = locs;
+  //fprintf(stderr,"\nChecking region : %s\n" , Absynpp::typ2string(r));
+  if(a || b || c ) {
+   let s1 = Position::string_of_segment(loc1);
+   let s2 = Position::string_of_segment(loc2);
+   Tcutil::terr(loc2,"Expected zero capability of %s"
+                    " in loop node (from %s to %s)"
+                     " but found (%d,%d,%d).",
+                      Absynpp::typ2string(r),s1,s2,a,b,c);
+  }
+}
+
+/*static void xcaps_zero_or_notlive(type_t r,xcap_t t, cons_t @`r c){
+  let &$(a,_,_) = t;
+  if(a) {
+    *c = new List(new Access(Not_Live,r,-1),*c);
+  }
+}*/
+
+static void cons_is_zero(cons_t c,xcaps_t ca,$(seg_t,seg_t) @`H loc){
+  for(;c;c=c->tl) switch(c->hd) {
+      case &Access(...):
+           continue; 
+      case &Spawn(c1,_,_):
+           for(;c1;c1=c1->tl) switch(c1->hd) {
+              case &Cap(a,b,c,r,_):
+                   switch(Hashtable::lookup_opt(ca,r)){
+                     case NULL:
+                          Hashtable::insert(ca,r,new $(-a,-b,-c));
+                          break;
+                     case &&$(*a0,*b0,*c0):
+                          *a0 -= a;
+                          *b0 -= b;
+                          *c0 -= c;
+                          break;
+                   }
+                   continue;
+              default: 
+                   env_err("cons_is_zero: Invalid Spawn format");
+          }
+          continue;
+     case &Call (c2,_,_):
+          cons_is_zero(c2,ca,loc);
+          continue;
+     case &Join (c11,c2,loc0):
+          let ca0 = ht_clone(ca);
+          cons_is_zero(c11,ca,loc);
+          cons_is_zero(c2,ca0,loc);
+          if(!ht_eq(ca,ca0)) { 
+            let &$(loc1,loc2) = loc;
+            let s1 = Position::string_of_segment(loc1);
+            let s2 = Position::string_of_segment(loc2);
+            Tcutil::terr(loc0,"Paths of join node %s do not match"
+                    " in join node (edge from %s to %s).",
+                     cons2string(c11),s1,s2);
+          }
+          continue;
+     case &Cap(a,b,c,r,loc):
+          switch(Hashtable::lookup_opt(ca,r)){
+            case NULL:
+                 Hashtable::insert(ca,r,new $(a,b,c));
+                 break;
+            case &&$(*a0,*b0,*c0):
+                 *a0 += a;
+                 *b0 += b;
+                 *c0 += c;
+                 break;
+          }
+          continue;
+     case &Empty: 
+          continue; 
+     case &Undefined:
+          env_err("cons_is_zero: Undefined constraint");
+  }
+}
+
+static bool xcap_ok(xcap_t x ){
+  let &$(a,b,c) = x;
+  return a > 0 && b > -1 && c > -1;
+}
+
+static xcap_opt_t xcap_add(xcap_t x0, xcap_t x1) {
+  let &$(a0,b0,c0) = x0;
+  let &$(a1,b1,c1) = x1;
+  if(a0 < 1 || b0 < 0 || c0 < 0 || 
+     (a1 < 0  && a0 + a1 < 0) ||
+     (b1 < 0  && b0 + b1 < 0) ||
+     (c1 < 0  && c0 + c1 < 0))
+     return NULL;
+  return new $(a0+a1,b0+b1,c0+c1);
+} 
+
+static xcap_opt_t xcap_xadd(xcap_t x0, xcap_t x1) {
+  let &$(a0,b0,c0) = x0;
+  let &$(a1,b1,c1) = x1;
+  bool cond[12] = {false,false,false,false,
+                   false,false,false,false,
+                   false,false,false,false};
+  if((cond[0]=!xcap_ok(x0)) ||
+     (cond[1]=!xcap_ok(x1)) || 
+     ((cond[2]=(b1 > 0 || a0 == a1)) && 
+      ((cond[3]=(b1 != b0)) || (cond[4]=c1 != c0))) ||
+      (cond[5]=(b1 == 0 && b0 > 0 && c1 !=0)) ||
+      (cond[6]=a1 > a0) || (cond[7]=b1 > b0) || 
+      (cond[8]=c1 > c0) 
+    ) {
+     //for(int i = 0; i < 9 ; i++)
+     //   fprintf(stderr,"\n%d=%d",i,cond[i]);
+     return NULL;
+    }
+   
+  return new $(a0-a1,b0-b1,c0-c1);
+}
+
+static void xcaps_print_iter(type_t k,xcap_t v) {  
+  fprintf(stderr,"\n\t%s (%d) --> %s",
+          Absynpp::typ2string(k),getid(k), xcap2string(v));
+}
+
+static void xcaps_xadd_iter(type_t r, xcap_t x,
+                            $(xcaps_t,seg_t)@ env) { 
+  let &$(sp,loc) = env;
+  switch(Hashtable::lookup_opt(sp,r)){
+    case NULL:
+         break;
+/*         Hashtable::iter(xcaps_print_iter,sp);
+         env_err("xcaps_xadd_iter: could not find \"%s\"",
+                  Absynpp::typ2string(r));*/
+    case opt:
+        xcap_t t = *opt;
+        let x0 = xcap_xadd(x,t);
+        if(x0) *x = *x0;
+        else 
+          Tcutil::terr(loc,"Invalid effect to spawn."
+                    " Counted %s for %s"
+                     " and spawn requires %s.",
+                     xcap2string(x),Absynpp::typ2string(r),
+                     xcap2string(*opt));
+        break;
+ }
+}
+
+static xcap_t get_xcap(xcaps_t x , type_t r) {
+   switch(Hashtable::lookup_opt(x,r)){ // find xcap
+       case NULL:
+            Hashtable::iter(xcaps_print_iter,x);
+            env_err("get_xcap: could not find %s",
+                     Absynpp::typ2string(r));
+       case &x0:
+            return x0;
+   }
+}
+
+///////////////////////////////////////////////////////////////
+/// Constraint Translation API
+///////////////////////////////////////////////////////////////
+
+
+struct TransEnv {
+   type_t   r;
+   xcap_t   c;
+   type_t   p;
+//   xcaps_t  x;
+//   rgnpar_t p;
+   list_t<seg_t,`H> path;
+   seg_t loc;
+   env_t env;
+};
+
+typedef struct TransEnv @`H tenv_t; 
+
+static string_t path2string(list_t<seg_t,`H> path){ 
+   return Absyn::list2string(List::rev(path),Position::string_of_loc);
+}
+
+static con_opt_t con_translate(access_t a,type_t r, seg_t loc, tenv_t te) {
+   let p = te->p; // parent_of(te->p,r);
+   if( p == no_parent) //return new Access(a,r,loc);
+     env_err("con_translate_0");
+   let ret = NULL;
+   let x = te->c; // get_xcap(te->x,r);
+   let &$(n1,n2,n3) = x;
+   if (a== Not_Live) {
+      if (n1 !=0 || n2 < 0 || n3 < 0)  
+         goto ERROR;
+   } else if(xcap_ok(x)) 
+    switch(a) {
+       case Live:
+            break;
+       case Rd:
+            if(n2+n3 > 0) a = Live;
+            else if( p == root) goto ERROR;
+            break;
+       case Not_RW:
+            if(n2+n3 != 0) goto ERROR;
+            break;
+       case Wr:
+            if(n2 > 0) a = Live;
+            else if( p == root) goto ERROR;
+            break;
+       case Not_W:
+            if(n2 != 0) goto ERROR;
+            break;
+       default:
+            env_err("con_translate_2");
+    } 
+   else 
+     goto ERROR; // Region must be dead
+
+   return (p != root)? new Access(a,p,loc) : NULL;
+ERROR:
+  Tcutil::terr(loc,"Could not solve: %s"
+                        " for region %s."
+                        " XCap: %s. Path: %s", 
+                         con2string(new Access(a,r,loc)), 
+                          Absynpp::typ2string(r),
+                          xcap2string(x), 
+                          path2string(te->path));
+  return NULL;
+}
+
+static cons_t cons_translate(cons_t c, tenv_t te, unsigned int depth){
+  //TODO: implement effect translation
+  cons_t ret = NULL,c_tmp = List::copy(c);
+  for(;c;c=c->tl){
+    con_opt_t cret = NULL;
+    switch(c->hd) {
+      case &Spawn(c1,c2,loc):
+         //let x0 = new_xcaps();
+         let rgns = xrgns_of_cons(c1); 
+         int a0=0,b0=0,c0=0;
+         cons_t c3 = NULL;
+         for(_ iter=c1,c1=NULL;iter;iter=iter->tl)
+           switch(iter->hd) {
+            case &Cap(a,b,c,r,loc):
+                 let cp = new $(a,b,c);
+                 if(!xcap_ok(cp) || a == 0) {
+                 Tcutil::terr(loc,"Invalid effect to spawn:"
+                              "%s --> %s. Path: %s", 
+                              Absynpp::typ2string(r),
+                              xcap2string(cp), 
+                              path2string(new List(loc,te->path)));
+                 }
+                 if(cmptypes(te->r,r)) {
+                   c3 = new List(iter->hd,c3);
+                } else {
+                   a0 += a;
+                   b0 += b;
+                   c0 += c;
+                 }
+                break;
+          default:
+                 env_err("cons_translate 1");
+       }
+       if(a0 + b0 + c0 == 0){ 
+         /*fprintf(stderr,"\nBREAKING region = %s:"
+                  " %d,%d,%d c1=%s", 
+                 xregion2string(te->r),
+                 a0,b0,c0,cons2string(c1));*/
+         if(c3) cret = c->hd;
+         break;
+       }
+       let thread_caps = new $(a0,b0,c0);
+       let te0 = new *te;
+       let cap_tmp  =  xcap_xadd(te->c,thread_caps);
+
+
+/*       fprintf(stderr,
+                    "=============  SPAWN  ============\n"
+                    "\nSPAWN region=%s "
+                    "before %s  / spawn = %s / after = %s\n"
+                    "EFFECT OF SPAWN: %s\n\n"
+                    "============= TRANSLATION FOR SPAWN ============\n",
+                     Absynpp::typ2string(te->r),
+                     xcap2string(thread_caps),
+                     xcap2string(te0->c),
+                     xcap2string(cap_tmp),
+                     cons2string(c2)
+               );*/
+
+       let sp = te0->c = new $(a0,b0,c0),
+                te0->p = te0->p != root && Set::member(rgns,te0->p)?
+                         te0->p:root,
+                         cons_translate(c2,te0,depth+1);
+
+      let b1 = sp == NULL || cons_is_empty(sp);
+/*       fprintf(stderr,"\n============= END TRANSLATION FOR SPAWN ============\n");*/
+
+        if(!cap_tmp) {
+           Tcutil::terr(loc,"Invalid effect to spawn."
+                    " Counted %s for %s"
+                     " and spawn requires %s.",
+                     xcap2string(te->c),
+                     Absynpp::typ2string(te->r),
+                     xcap2string(thread_caps));
+        }
+        else te->c = cap_tmp;
+        ////////////////////////
+        // Generate negative constraints for the two threads
+        ///////////////////////
+         con_opt_t this_thread = NULL;
+         con_opt_t new_thread  = NULL;
+         let r = te->r;
+         let p = te->p; 
+        // fprintf(stderr,"\nParent of %s -> %s",
+          //        xregion2string(r),xregion2string(p));
+         if(p != no_parent && p != root) {
+             let &$(a,b,c) = te->c; //get_xcap(te->x,r);
+             if(b) 
+              new_thread = new Access(Not_RW,p,loc);
+             else if(c) 
+              new_thread = new Access(Not_W,p,loc);
+             if(a) {
+                if(b0) 
+                  this_thread = new Access(Not_RW,p,loc);
+                else if(c0) 
+                  this_thread = new Access(Not_W,p,loc);
+            }
+        }
+        ////////////////////////
+        // Add translated effects + negative constraints 
+        ///////////////////////
+         //if(!b1){ 
+           if(new_thread)
+             sp = new List(new_thread,sp);
+            ret = new List(new Spawn(c3,sp,loc),ret);
+         // }
+         if(this_thread)
+           ret = new List(this_thread,ret);
+
+        // fprintf(stderr,"\nSPAWN ret: %s", cons2string(ret));
+         break;
+    case &Cap(a,b,c00,r,loc):
+         if(cmptypes(te->r,r)) {
+           cret  = c->hd;
+           break;
+         }
+         let x = te->c; //get_xcap(te->x,r);
+         let cp = new $(a,b,c00);
+         let x0 = xcap_add(x,cp);
+         if(!x0)
+             Tcutil::terr(loc,"Invalid effect for cap:"
+                              "%s (id=%d) -->curr=%s"
+                              " cap=%s. Path: %s", 
+                              Absynpp::typ2string(r),
+                              getid(r),
+                              xcap2string(x),
+                              xcap2string(cp),
+                            path2string(new List(loc,te->path)));
+         else {
+                 /* fprintf(stderr,"\nCAP %s :  %s ---> %s",
+                        Absynpp::typ2string(r),
+                           xcap2string(x),
+                           xcap2string(x0));*/
+                 te->c = x0;
+                 if(te->p != root) 
+                  cret = new Access(Live,te->p,loc); 
+         }
+         break;
+   case &Call(ca,loc,s):
+        let path = te->path;
+
+    /*   fprintf(stderr,"\nCALL (fun=%s,%s): region=%s"
+               " cons=%s\n",
+                s,
+                Position::string_of_loc(loc),
+                Absynpp::typ2string(te->r),
+                cons2string(ca)
+              );*/
+
+        te->path = new List(loc,te->path);
+        ca = cons_translate(ca,te,depth+1);
+
+    /*   fprintf(stderr,"\nEND CALL (fun=%s,%s): region=%s "
+               "cons=%s\n",
+                s,
+                Position::string_of_loc(loc),
+                Absynpp::typ2string(te->r),
+                cons2string(ca)
+              );*/
+        let b1 = ca == NULL || cons_is_empty(ca);
+        if(!b1)
+          cret = new Call(ca,loc,s);
+        te->path = path;
+        break;
+   case &Access(a,r,loc):
+        if(cmptypes(te->r,r)) 
+          cret  = c->hd;
+        else
+          cret = con_translate(a,r,loc,te);
+        break;
+   case &Join(ca,cb,loc):
+        let path = te->path;
+        te->path = new List(loc,path);
+        let te0 = new *te;
+        te0->c = new *te->c;
+        if(get_debug()) 
+        fprintf(stderr,"\nJOIN (before): region=%s"
+               " Left path(%p) = %s Right Path(%p)=%s",
+                Absynpp::typ2string(te->r),te->c,
+                xcap2string(te->c), te0->c,
+                xcap2string(te0->c)
+              );
+        let ca0 = cons_translate(ca,te0,depth+1);
+        let ca1 = cons_translate(cb,te,depth+1);
+        te->path = path;
+       if(get_debug()) 
+       fprintf(stderr,"\nJOIN (after): region=%s"
+               " Left path(%p) = %s Right Path(%p)=%s",
+                Absynpp::typ2string(te->r),te->c,
+                xcap2string(te->c), te0->c,
+                xcap2string(te0->c)
+              );
+ 
+//         Hashtable::iter(xcaps_print_iter,x1);
+
+        /*fprintf(stderr,"\nJOIN:\nBefore:");
+         Hashtable::iter(xcaps_print_iter,x1);
+        fprintf(stderr,"\n\nTable1:");
+         Hashtable::iter(xcaps_print_iter,x);
+        fprintf(stderr,"\nJOIN:\nTable2:");
+         Hashtable::iter(xcaps_print_iter,x0);
+        fprintf(stderr,"\n\nEND JOIN\n\n.");*/
+        if(!xcap_eq(te->c,te0->c)) { 
+            Tcutil::terr(loc,"Capabilities of paths %s and %s do"
+                 " not match: %s (first path) %s (second path).",
+                 cons2string(ca),cons2string(cb),
+                 xcap2string(te0->c),xcap2string(te->c));
+       }
+       let b1 = ca0 == NULL || cons_is_empty(ca0);
+       let b2 =  ca1 == NULL || cons_is_empty(ca1);
+       if(b1 && b2);
+       else
+        cret = new Join(ca0,ca1,loc);
+       /*else if(b1 && b2); 
+       else if (!b1) {
+         ca0 = List::rev(ca0); 
+         ret = List::append(ca0,ret);
+       } else if (!b2) {
+         ca1 = List::rev(ca1); 
+         ret = List::append(ca1,ret);
+       }*/
+       break;
+     case &Empty:
+          cret = con_empty();
+          break;
+     case &Undefined:
+          env_err("cons_translate: undefined");
+  }
+  if(cret) ret = new List(cret,ret);
+ }
+ if(!depth) {
+   let &$(a,_,_) = te->c; //get_xcap(te->x,r);
+   if(a) {
+     if(te->p == root) 
+        Tcutil::terr(te->loc,"Region %s is not deallocated."
+                     "\nReference count = %d."
+                     "\nConstraint = %s",
+                     Absynpp::typ2string(te->r),
+                     a,cons2string(c));
+     else
+       ret = new List(new Access(Not_Live,te->p,-1),ret);
+   }
+ }
+ return List::rev(ret);
+}
+
+///////////////////////////////////////////////////////////////
+/// Constraint Flow API
+///////////////////////////////////////////////////////////////
+
+static void node_in_flow(env_t env,node_t from,node_t to) {
+  if(from->is_exit) return;
+  if(from == to) 
+    env_err("node_in_flow: same node: %s ---> %s",
+            node2string(from),node2string(to));
+
+  let from_id = node_id(from);
+  let to_id = node_id(to);
+//  let $(l0,c0) = seg2lineno(from->loc);
+//  let $(l1,c1) = seg2lineno(to->loc);
+  let is_frontedge = from_id > to_id;
+                  /* (!to->may_have_backedges) || 
+                     ((!to->is_exit) &&
+                     ((l0 < l1) || 
+                      (l0 == l1 && c0 <= c1)));*/
+
+  if(is_frontedge)
+   to->preds_front_visited++;
+
+  if(get_debug()) {
+   string_t s0 = rgnpar2string(decls2rgns(from->enclosing_xrgn));
+   string_t s1 = rgnpar2string(decls2rgns(to->enclosing_xrgn));
+   fprintf(stderr,"\n\t@FLOW: NODE[%d](\"%s\") {%s} --(%s)--> "
+                  "NODE[%d|%d/%d](\"%s\") {%s}",
+           from_id,node2string(from),s0,
+           is_frontedge?"F":"B",
+           to_id,
+           to->preds_front_visited,
+           to->preds_front,node2string(to),s1);
+  }
+
+
+  let flow = from->output;
+  if(cons_is_undefined(flow))
+    env_err("node_in_flow: undefined constraint.");
+
+/*  if(is_frontedge) { 
+   fprintf(stderr,"\n\t\tINPUT CAP 1: %s"
+                  "\n\t\tMERGE CAP 2: %s",
+            cons2string(from->output),
+            cons2string(to->input)
+          );
+  }*/
+
+  // TRANSLATE FLOW
+  let diff_opt=node_diff_enclosing_xrgn(from,to);
+  if(diff_opt) { //translate the effect
+   let diff = decls2rgns(diff_opt);
+   let order = decls2order(diff_opt);
+   if(get_debug()) {
+     string_t s = rgnpar2string(diff);
+     fprintf(stderr,"\n\t\t@TRANSLATE: {%s} "
+              "NODE(\"%s\") ---> NODE(\"%s\")",
+            s,node2string(from),node2string(to));
+   }
+   let x = rgnpar2xcaps(diff);
+   if(get_debug())
+    fprintf(stderr,"\n\t\t\tBEFORE: %s",
+            cons2string(flow));
+   let te = new TransEnv(root,new $(1,1,0),
+                         root,NULL,from->loc,env);
+   //translate in reverse order
+   for(;order;order=order->tl){
+      let r = order->hd;
+      if(get_debug())
+      fprintf(stderr,"\n\n[B] TRANSLATING: %s FLOW=%s\n\n",
+              Absynpp::typ2string(r),cons2string(flow));
+      te->r = r;
+      *te->c = $(1,1,0);
+      te->p = parent_of(diff,r);
+      te->path = NULL;
+      flow = cons_translate(flow,te,0);
+      if(get_debug())
+      fprintf(stderr,"\n[A] TRANSLATING: %s FLOW=%s\n\n",
+              Absynpp::typ2string(r),cons2string(flow));
+   }
+   if(get_debug())
+    fprintf(stderr,"\n\t\t\tAFTER: %s",cons2string(flow));
+    /*let not_live = NULL;
+    Hashtable::iter_c(xcaps_zero_or_notlive,x,&not_live); 
+    if(not_live)
+       flow = List::append(flow,cons_translate(not_live,te));*/
+  }
+  // END TRANSLATION
+  if(is_frontedge) {
+    to->input = cons_merge(to->input,flow,to->loc);
+   /*fprintf(stderr,"\n\t\tRESULT     : %s"
+            ,cons2string(to->input)
+          );*/
+
+  } else { //backedge
+    //flow = cons_prefix(flow);
+   // to->input = cons_merge(to->input,flow,to->loc);
+    let in = to->input;
+    let out0 = cons_prefix(flow);
+    let out = out0;
+    let in_len = List::length(in);
+    let out_len = List::length(out);
+
+    /*fprintf(stderr,"\nBACKEDGE:\n"
+              "\nINPUT:%s\n\nOUTPUT:%s\n\n\nPREFIX=%s\n\n",
+               cons2string(in),cons2string(flow),
+               cons2string(out0)
+           );*/
+
+    if(out_len < in_len) 
+      env_err("node_in_flow: outlen < in_len."
+              "\nINPUT:%s\nOUTPUT:%s\n",
+               cons2string(in),cons2string(out));
+    if(!cons_is_empty(in)) {
+       for(;in_len;in_len--,out=out->tl);
+       /*fprintf(stderr,"FINAL:%s\n\n",
+               cons2string(out));*/
+
+    }
+    if(get_debug())
+    fprintf(stderr,"\nBackedge: \n\t--->Loop: %s\n\t--->In=%s"
+            "\n\t--->Out=%s",cons2string(out),
+            cons2string(in),cons2string(out0));
+    let x = new_xcaps();
+    let loc = new $(from->loc,to->loc);
+    cons_is_zero(out,x,loc);
+     Hashtable::iter_c(xcaps_zero,x,loc); 
+  }
+}
+
+static void node_out_flow(env_t env,node_t n, con_opt_t c) {
+  if(c)
+    n->output = cons_append(n->input,cons_singleton(c));
+  else
+    n->output = copy_cons(n->input);
+  for(_ iter=n->succ;iter;iter=iter->tl) // update succs
+     node_in_flow(env,n,iter->hd);
+}
+
+static void node_out_flows(env_t env,node_t n, cons_t c) {
+  if(n->is_exit) return;
+  if(cons_is_undefined(n->input)) 
+    env_err("node_out_flows: \"%s\" ---> undefined input.",
+            node2string(n));
+  if(c)
+    n->output = cons_append(n->input,c);
+  else
+    n->output = copy_cons(n->input);
+//  fprintf(stderr,"\nNODE(\"%s\"): OUT(\"%s\") ",node2string(n),
+//            cons2string(n->output));
+  for(_ iter=n->succ;iter;iter=iter->tl) { // update succs
+  //   fprintf(stderr,"\n\t\t@ NODE(\"%s\") ---> NODE(\"%s\")",
+//            node2string(n),node2string(iter->hd));
+     node_in_flow(env,n,iter->hd);
+  }
+}
+
+///////////////////////////////////////////////////////////////
+/// Constraint Generation API
+///////////////////////////////////////////////////////////////
+static fndecl_opt_t exp2fd_opt(exp_t e0) {
+        switch(e0->r) {
+         case &Instantiate_e(&{.r=&Var_e(&Funname_b(fd)),...},_):
+              fallthru(fd);
+         case &Cast_e(_,&{.r=&Var_e(&Funname_b(fd)),...},_,_):
+              fallthru(fd);
+         case &Var_e(&Funname_b(fd)):
+              return fd;
+          default:
+              return NULL; 
+        }
+}
+
+static fndecl_opt_t exp2fd(exp_t e0, string_t msg) {
+ let fd = exp2fd_opt(e0); 
+ if(!fd) env_err("exp2fd: %s",msg);
+ return fd;
+}
+ 
+static cons_t xrgns2cons(list_t<type_t,`H> rgns,access_t a,seg_t loc){
+  let ret = NULL;
+  for(;rgns;rgns=rgns->tl)
+     ret = new List((con_t) (new Access(a,rgns->hd,loc)),ret);
+  return ret;
+}
+
+static list_t<type_t,`H> xrgns_of_lvalue(exp_t e) {
+  switch (e->r) {
+  case &Var_e(&Funname_b(_)): 
+       env_err("rgns_of_lvalue 0");
+  case &Var_e(&Global_b(vd)): 
+		 fallthru(vd);
+  case &Var_e(&Local_b(vd)):
+       switch (Tcutil::compress(vd->type)) {
+          case &ArrayType(_):
+               env_err("rgns_of_lvalue 1");
+          default: 
+               return xrgns_of(e->topt);
+       }
+  case &Var_e(...):
+       return xrgns_of(e->topt);
+  case &AggrMember_e(e1,...): 
+       fallthru(e1);
+  case &Instantiate_e(e1,...): 
+       fallthru(e1);
+  case &NoInstantiate_e(e1): 
+       fallthru(e1);
+  case &AggrArrow_e(e1,...):   
+       fallthru(e1);
+  case &Deref_e(e1):
+       fallthru(e1);           
+  case &Subscript_e(e1,_):  
+       return xrgns_of(e1->topt);
+  default:                 
+       env_err("rgns_of_lvalue 2");
+  }
+}
+
+typedef Hashtable::table_t<type_t,type_t> tvmap_t;
+static void print_tvmap_iter(type_t t1,type_t t2){
+  fprintf(stderr,"\n\t [%s] ---> [%s]", 
+          Absynpp::typ2string(t1),
+          Absynpp::typ2string(t2));
+}
+static type_t rgn_subst(type_t r, tvmap_t m) {
+   switch(Hashtable::lookup_opt(m,r)){
+      case NULL:
+           Hashtable::iter(print_tvmap_iter,m);
+           env_err("rgn_subst: could not find \"%s\"",
+                   Absynpp::typ2string(r)); 
+      case &r0:
+           return r0;
+   }
+}
+static cons_t cons_subst(cons_t c, tvmap_t m){
+  let r = NULL;
+  for(;c;c=c->tl) {
+    con_t c0;
+    switch(c->hd) {
+     case &Access(a,r,loc):
+         c0 = new Access(a,rgn_subst(r,m),loc);
+         break;
+     case &Cap(a,b,c,r,loc): 
+         c0 = new Cap(a,b,c,rgn_subst(r,m),loc);
+         break;
+     case &Join(c1,c2,loc):
+         c0 = new Join(cons_subst(c1,m),
+                       cons_subst(c2,m),loc);
+         break;
+     case &Spawn(c1,c2,loc):
+         c0 = new Spawn(cons_subst(c1,m),
+                       cons_subst(c2,m),loc);
+         break;
+    case &Call (c1,loc,s):
+         c0 = new Call(cons_subst(c1,m),loc,s);
+         break; //continue;
+     case r:
+         c0 = r;
+         break;
+    }
+	 /*fprintf(stderr,"\nSUBST %s WITH %s",	
+					con2string(c->hd), con2string(c0));*/
+    r = new List(c0,r);
+  }
+  return List::rev(r);
+}
+
+/* actual effect, formal effect, constraint*/
+static cons_t effect_subst(seg_t loc,type_opt_t e1,type_opt_t e2,cons_t c) {
+ let l0 = xrgns_of(e1); 
+ let l1 =  xrgns_of(e2);
+
+   /*let s0 = Absyn::list2string(l0,
+                               Absynpp::typ2string);   
+   let s1 =   Absyn::list2string(l1,
+                                 Absynpp::typ2string);  
+	// 
+	fprintf(stderr,"\nEffect subst:\n actual=%s\nformal=%s\n",
+				s0,s1);*/
+ 
+ let iter1=l1;
+ let iter2=l0;
+ let ht = Hashtable::create(33,cmptypes,hash_type);
+ for(;iter1 && iter2; iter1=iter1->tl,iter2=iter2->tl)
+ Hashtable::insert(ht,iter1->hd,iter2->hd);
+ if(iter1 || iter2) {
+   let s0 = Absyn::list2string(l0,
+                               Absynpp::typ2string);   
+   let s1 =   Absyn::list2string(l1,
+                                 Absynpp::typ2string);   
+	//
+	Tcutil::terr(loc,"Attempting to substitute  {%s} ---> {%s}."
+						"The substitution lists must be"
+						" of the same length.\n "
+						"Are you passing an XRgn as normal R?"
+						" use `r::X to declare X regions.",s0,s1);
+   //env_err("effect_subst {%s} ---> {%s}\n",s0,s1);
+ }
+ return cons_subst(c,ht);
+}
+
+/* convert a list of expressions to Cap constraint*/
+static con_t exps2con( list_t<exp_t> el,seg_t loc) {
+  if(!el) env_err("exps2con 0");
+  let x = xrgns_of(el->hd->topt);
+  if(!x || x->tl )
+  env_err("exps2con 1");
+  let c1 = el->tl->hd;
+  let c2 = el->tl->tl->hd;
+  let c3 = el->tl->tl->tl->hd;
+  let $(i1,_) = Evexp::eval_const_uint_exp(c1);
+  let $(i2,_) = Evexp::eval_const_uint_exp(c2);
+  let $(i3,_) = Evexp::eval_const_uint_exp(c3);
+  return new Cap(i1,i2,i3,x->hd,loc);
+}
+
+static list_t<type_t,`H> xrgns_of_ptr(type_t t ) {
+	switch(Tcutil::compress(t)) {
+	   case &PointerType(PtrInfo(_,_,PtrAtts(rt,...))):
+			    /*fprintf(stderr,"\nHERE! : type : %s", 
+				 			 Absynpp::typ2string(t));*/
+             let x = xrgns_of(rt);
+			    let s = Absyn::list2string(x,Absynpp::typ2string);
+				 /*fprintf(stderr,"\nRegions of type : %s",s);*/
+				 return x;
+	   default:
+		    env_err("xrgns_of_ptr: bad pointer type: %s",
+								Absynpp::typ2string(t));
+ 	}
+}
+
+/* returns true if the node out flow was sent to its succs*/
+static bool node_update_flow(node_t n,env_t env) {
+
+   if(n->preds_front_visited < n->preds_front) {
+     /*fprintf(stderr,"\nPLACING BACK: %s"
+               " [id=%d, %d/%d]", 
+                 node2string(n),node_id(n),
+                 n->preds_front_visited,
+                 n->preds_front
+            );*/
+     return false;
+   }
+   switch(n->n) {
+      case &Exp(e):
+           switch(e->r) {
+             case &Deref_e(e1):
+                  fallthru(e1);
+             case &AggrArrow_e(e1,_,_,_): 
+                  let cons = xrgns2cons(xrgns_of_ptr(e1->topt),Rd,e1->loc);
+                  node_out_flows(env,n,cons);
+                  break;
+             case &Subscript_e(e1,e2): //e1
+                   let cons = xrgns2cons(xrgns_of_ptr(e1->topt),Rd,e1->loc);
+					    /*fprintf(stderr,"\nAssignOp : \"%s\""
+										"  |cons(e1)=%s at %s",
+		                           Absynpp::exp2string(e1),
+      		                     cons2string(cons),
+											Position::string_of_loc(e->loc)
+									);*/
+
+                  node_out_flows(env,n,cons);
+                  break;
+   	     case &AssignOp_e(e1,_,e2):
+                  let l = xrgns_of_lvalue(e1);
+                  /*let n1 = get_exp(env_fenv(env),e1);
+                  let c1 = get_input(n1);
+
+                  string_t s = Absyn::list2string
+                              (l,Absynpp::typ2string);
+                  fprintf(stderr,"\nAssignOp : \"%s\" --> [%s]  |cons(e1)=%s",
+                           Absynpp::exp2string(e1),
+                           s,cons2string(c1));*/
+
+						let n_e = get_exp(env_fenv(env),e1);
+						let n_i = get_input(n_e);
+						let n_o = get_output(n_e);
+						if(List::length(n_i) == List::length(n_o))
+							l = NULL;
+                  let cons = xrgns2cons(l,Wr,e1->loc);
+                  node_out_flows(env,n,cons);
+                  break;
+	 	     case &Swap_e(e1,e2):  
+                  let rgns = List::append(xrgns_of(e1->topt),
+                                          xrgns_of(e2->topt));
+                  let cons = xrgns2cons(rgns,Wr,e->loc);
+                  node_out_flows(env,n,cons);
+                  break;
+           case &FnCall_e(e0,_,_,_,_):
+                  let caller=fenv_get_fd(env_fenv(env));
+                  let callee=exp2fd_opt(e0);
+                  con_t con;
+                  
+                     //fprintf(stderr,"\nCall effect for : %s",
+                       //     callee_name);
+                  if(!callee) {
+                     //let callee_name =  Absynpp::exp2string(e0);
+                    // fprintf(stderr,"\nCould not find effect of : %s. Empty effect.",
+                      //      callee_name);
+                     //con = consnew Call(cons_empty(),e->loc,callee_name);
+                     node_out_flows(env,n,cons_empty());
+                  }
+                  else {
+                    let name =  *(*callee->name)[1];
+                    let i = fn_type((type_t)e0->topt);
+                     let caller_name =  *(*caller->name)[1];
+							cons_t cons = NULL;
+							//if recursive function call
+							if(!Absyn::qvar_cmp(caller->name,callee->name)) {
+							 	cons = NULL;
+								set_recursive(env_fenv(env)); // register recursive
+							} else {// if not recursive function call
+							  let cons0 = env_fd2cons(env,callee);
+                     	cons = effect_subst(n->loc,i.effect,
+														  callee->i.effect,
+	                                         cons0);
+	                    /*fprintf(stderr,"\nFnCall: %s ---> %s :\n"
+												"BEFORE:%s\nAFTER: %s\n", 
+	                             caller_name, Absynpp::exp2string(e0),
+   	                          cons2string(cons0),cons2string(cons));*/
+						   }
+                     con = new Call(cons,e->loc,name);
+                     node_out_flow(env,n,con);
+                  }
+                  break;
+   
+              case &Malloc_e(m):
+				       let eopt = m.rgn;
+                   if(eopt) {
+                     let cons = xrgns2cons(xrgns_of(
+                            eopt->topt),Live,eopt->loc);
+                     node_out_flows(env,n,cons);
+                   } else 
+                     node_out_flows(env,n,cons_empty());
+                   break;
+              case &New_e(eopt,e1):
+                   if(eopt) {
+                     let cons = xrgns2cons(xrgns_of(
+                              eopt->topt),Live,e1->loc);
+                     node_out_flows(env,n,cons);
+                   } else 
+                     node_out_flows(env,n,cons_empty());
+                   break;
+              default: 
+                  //fprintf(stderr,"\nFLOWS_EMPTY_EXP");
+                  node_out_flows(env,n,cons_empty());
+                  break;
+           }
+           break;
+      case &Stmt(s):
+           switch(s->r) {
+             case &Cap_s(el):
+                  let c0 = exps2con(el,s->loc);
+                  node_out_flow(env,n,c0);
+                  break; 
+             case &Spawn_s(el,e0,_):
+                  let fd = (fndecl_t) exp2fd(e0,
+                                  "node_update_flow: Spawn_s");
+                  let c0 = env_fd2cons(env,fd);
+                  let i = fn_type((type_t)e0->topt);
+                  //substitute regions
+                  c0 = effect_subst(n->loc,i.effect,fd->i.effect,c0);
+                  let c1 = NULL;
+                  for(;el;el=el->tl) switch(el->hd->r) { 
+                   case &Tuple_e(el0):
+                        c1 = new List(exps2con(el0,s->loc),c1);
+                        break;
+                   default:
+                        env_err("tuple2con: %s",
+                        Absynpp::exp2string(el->hd));
+                        break;
+                   }
+                   let s1 = Set::from_list(cmptypes,
+                                         xrgns_of(i.effect));
+                   let s2 = xrgns_of_cons(c1);
+                   if(!Set::subset(s1,s2)) {  // sanity check
+                     let name =  *(*fd->name)[1];
+                     fprintf(stderr,"\nRegions of \"%s\":",name);
+                     Set::iter(iter_xrgn,s2);
+                     fprintf(stderr,"\nRegions of spawn:");
+                     Set::iter(iter_xrgn,s1);
+                     Tcutil::terr(s->loc,
+                                  "Thread \"%s\" uses more "
+                                  "x-regions than the regions "
+                                  "explicitly passed to "
+                                  "spawn construct.",name);
+                   }
+                   node_out_flow(env,n,new Spawn(c1,c0,s->loc));
+                   break;
+            default:
+                 //fprintf(stderr,"\nFLOWS_EMPTY_STMT");
+                 node_out_flows(env,n,cons_empty());
+                 break;
+           }
+           break;
+      case &Pat(p):
+           let rgns = xrgns_of_pat(p);
+           let cons = xrgns2cons(rgns,Rd,p->loc);
+			  /* fprintf(stderr,"\nPat(%p) : \"%s\""
+										"  |cons(e1)=%s at %s", p,
+		                           Absynpp::pat2string(p),
+      		                     cons2string(cons),
+											Position::string_of_loc(n->loc)
+									);*/
+           node_out_flows(env,n,cons);
+           break;
+      case &Decl(d):
+           switch(d->r) {
+             case &Region_d(tv,_,eo):
+                  if(Absyn::is_xrgn_tvar(tv) && eo) {
+							let t = ((type_t)eo->topt); 
+                     let x = xrgns_of(t);
+                     if(!x) fallthru; 
+                     if(x->tl) 
+                       env_err("node_update_flow:"
+                               " Decl 1"); 
+                     node_out_flow(env,n,new Access(Live,
+                                     x->hd,eo->loc));
+                  } else 
+	                 node_out_flow(env,n,NULL);
+                  break;
+             default:
+                  //fprintf(stderr,"\nFLOWS_EMPTY_DECL");
+                  node_out_flow(env,n,NULL);
+                  break;
+           }
+           break;
+   }
+   return true;
+}
+
+/*
+struct Node {
+  node_type_t n;
+  nannot_t annot;
+  seg_t	 loc;
+  cons_t input;
+  cons_t current;
+  cons_t output; // NULL for definite jumps (bottom effect)
+  qvlist_t throws; 
+  nlist_t  succ; // successors -- via jump
+  list_t<decl_t,`H>  enclosing_xrgn;
+  bool is_exit;
+ };
+
+*/
+
+static void node_in_flow_empty(node_t n){
+  n->input = cons_empty(); 
+}
+
+static void work_list(node_t n, bool f(node_t,`b),`b b) { 
+ nset_t visited = Set::empty(Core::ptrcmp); 
+ nlist_t workq = new List(n,NULL);
+ while(workq){
+   n = workq->hd;
+   workq = workq->tl;
+   if(!Set::member(visited,n)){
+       if(f(n,b)) {
+         visited = Set::insert(visited,n);
+         workq = List::append(workq,
+                 node_succs(n));
+       } else // process others 
+         workq =  List::append(workq,new List(n,NULL));
+   }
+ }
+}
+
+// get all nodes for this function
+static void ins_node(void @ dummy1, node_t n, nset_t @ s){
+ *s = Set::insert(*s,n);
+}
+static nset_t all_nodes(fenv_t fenv) { 
+ let s = Set::empty(Core::ptrcmp);
+ Hashtable::iter_c(ins_node,fenv->nodes,&s);
+ return s;
+}
+static bool reachable_node(node_t n, nset_t @ s){
+ *s = Set::insert(*s,n);
+ return true;
+}
+// remove pred references from the successor(s) of
+// an unreachable node n.
+static void adjust_succs(node_t n) {
+ let n_id = node_id(n);
+ for(_ iter=n->succ; iter ; iter=iter->tl) {
+   let hd = iter->hd;
+   if( n_id > node_id(hd))
+     hd->preds_front--;
+ }
+}
+static void adjust_pred_counts(fenv_t fenv, node_t n) {
+  nset_t all,reachable,unreachable;
+   all = all_nodes(fenv); 
+   reachable = Set::empty(Core::ptrcmp);
+   work_list(n,reachable_node,&reachable);
+   unreachable = Set::diff(all,reachable);
+   Set::iter(adjust_succs,unreachable);
+}
+
+static bool print_dot(node_t n,dotfile_t f) {
+   node_print_dot(n,f);
+   return true;
+}
+static bool process_node(node_t n, env_t env){
+ let b  = node_update_flow(n,env);
+ if(b) {
+   let genv = env_genv(env);
+   let dfiles = genv_dotfiles(genv);
+   let d2 = dfiles->tl->hd;
+   node_print_dot(n,d2);
+  }
+  return b;
+}
+static void analyze_cfg(env_t env, node_t root) {
+  let fenv = env_fenv(env);
+  let genv = env_genv(env);
+  let dfiles = genv_dotfiles(genv);
+  let $(d1,d2) = $(dfiles->hd,dfiles->tl->hd);
+  let name =  *(*(fenv_get_fd(fenv))->name)[1];
+
+  // fprintf(stderr,"\n------------------------");
+  //remove unreachable preds
+  adjust_pred_counts(fenv,root); 
+  //root has empty flow 
+  node_in_flow_empty(root);
+
+  // print the graph before fn call
+//  open_dot_fun(d1,name);
+//  work_list(root,print_dot,d1);
+//  close_dot_fun(d1);
+  // main analysis
+  open_dot_fun(d2,name);
+  work_list(root,process_node,env);
+  close_dot_fun(d2);
+}
+
+/****************************************************************
+ *  Call graph API 
+ *
+ *
+ *
+ *
+ ****************************************************************/
+static cnode_t get_cgnode(cgenv_t env,fndecl_t fd) {
+ let o = Hashtable::lookup_opt(env->fnmap,fd);
+ if(o) return *o;
+ let n = new CallNode(fd,0,0,false,0); 
+ Hashtable::insert(env->fnmap,fd,n);
+
+ //let name = *(*fd->name)[1];
+ //printf("\n@@@@NAME: %s ---> fd=%p n=%p\n",name,fd,n);
+
+ let iter = NULL;
+ // add it if it doesn't exist in succs
+ for( iter=env->leafs;
+       iter && iter->hd!=n;iter=iter->tl);
+ if(!iter) {
+  env->leafs = new List(n,env->leafs); 
+ }
+ return n;
+}
+
+static void cgenv_register_fd(cgenv_t<`r> env, fndecl_t fd, bool is_spawn){
+  let isxrgn = fd->i.ieffect != 0;
+  let pred = get_cgnode(env,fd);
+  let cur = env->current;
+  if( pred == cur) return; //recursive
+  let iter = NULL;
+
+  let name = *(*fd->name)[1];
+  let cname = *(*(cur->fd)->name)[1];
+  // add it if it doesn't exist in succs
+  for( iter=cur->succs;
+       iter && iter->hd!=pred;iter=iter->tl);
+   if(!iter) {
+     try{
+       env->leafs = delete(env->leafs,cur);
+     } catch {
+       case &Core::Not_found: 
+            break;
+       default:
+            env_err("cg_visit_e");
+     }
+   }
+
+   //if(!isxrgn) return; 
+   /* do not include in call-graph. No need to visit fun*/
+   if(!iter)
+     cur->succs = new List(pred,cur->succs);
+   
+    // add it if it doesn't exist in preds
+   for( iter=pred->preds;
+        iter && iter->hd!=cur;iter=iter->tl);
+   if(!iter)
+     pred->preds = new List(cur,pred->preds);
+}
+
+static bool cg_visit_e(cgenv_t<`r> env, exp_t e) {
+  switch(e->r) {    
+     case &FnCall_e(e1,_,_,_,_):
+          switch(e1->r) {   
+            case &Instantiate_e(&{.r=&Var_e(&Funname_b(fd)),...},_):
+                 fallthru(fd);
+            case &Var_e(&Funname_b(fd)):
+                 cgenv_register_fd(env,fd,false);
+                 break; 
+            case &Var_e(&Global_b(vd)):
+               //prototype exists, but body not found
+               let isxrgn = fn_type(vd->type).ieffect !=0;
+               if(isxrgn)
+                 Tcutil::terr(e->loc,"Found prototype of a @xrgn effect, which is not associated with a function declaration in this module (%s).",last_filename);
+               //otherwise don't care about function call
+               break;
+            case &Instantiate_e(&{.r=&Var_e(&Global_b(vd)),...},t):
+               let isxrgn = fn_type(vd->type).ieffect !=0;
+               if(isxrgn)
+                 Tcutil::terr(e->loc,"Found prototype of a @xrgn effect, which is not associated with a function declaration in this module (%s).",last_filename);
+               //otherwise do not care
+               break;
+   /* 
+           case &NoInstantiate_e(e):
+                 fprintf(stderr,"\nNoInste_e\n");
+                 break;
+
+             case &Var_e(&Local_b(vd)):
+                  fprintf(stderr,"\nLoval SCOPE: %s\n" ,
+                         Absynpp::scope2string(vd->sc ));
+                  fflush(stderr);
+                  break;
+             case &Var_e(&Unresolved_b(qv)):
+                  fprintf(stderr,"\nUnresolved qv\n");
+                  break;
+             case &Var_e(...):
+                  fprintf(stderr,"\nVar_e\n");
+                  break;
+             case &Deref_e(_): // *e
+                  fprintf(stderr,"\nDeref_e\n");
+                  break;
+             case &Address_e(_): // *e
+                  fprintf(stderr,"\nAddress_e\n");
+                  break;
+             case &Cast_e(...): // *e
+                 fprintf(stderr,"\nCast_e\n");
+                 break;
+*/
+            default:
+                 env_err("Cannot handle this: \"%s\" (cg_visit_e)", Absynpp::exp2string(e1));
+          }
+          break;
+     default: 
+          break;
+  }
+  return true;
+}
+
+static bool cg_visit_s(cgenv_t<`r> env, stmt_t s) {
+ switch(s->r) {
+   case &Spawn_s(_,e0,_):
+        switch(e0->r) {
+         case &Instantiate_e(&{.r=&Var_e(&Funname_b(fd)),...},_):
+              fallthru(fd);
+         case &Cast_e(_,&{.r=&Var_e(&Funname_b(fd)),...},_,_):
+              fallthru(fd);
+         case &Var_e(&Funname_b(fd)):
+              cgenv_register_fd(env,fd,true);
+              break;
+          default:
+              env_err("cg_visit_s: Spawn_s"); 
+        }
+        break;
+   default:
+        break;
+ }
+ return true;
+}
+
+static void construct_cg(cgenv_t<`r> env,
+                        list_t<Absyn::decl_t,`H> tds) {
+  for(; tds != NULL; tds = tds->tl) {
+    switch (tds->hd->r) {
+    case &Let_d(...):
+    case &Letv_d(...):
+    case &Region_d(...):
+    case &Var_d(...):
+    case &Typedef_d(...):
+    case &Aggr_d(...):
+    case &Datatype_d(...):
+    case &Enum_d(...):
+    case &Porton_d:
+    case &Portoff_d:
+    case &Tempeston_d:
+    case &Tempestoff_d:
+    case &ExternC_d(...):
+    case &ExternCinclude_d(...): 
+         continue;
+    case &Namespace_d(_,tds2): 
+         fallthru(tds2);
+    case &Using_d(_,tds2): 
+         construct_cg(env,tds2); 
+         break;
+    case &Fn_d(fd): 
+         let c = env->current;
+         let n = get_cgnode(env,fd);
+         env->current = n; 
+         let name = *(*fd->name)[1];
+         if(!strcmp(name,"main")) {
+           env->main = n;
+         }
+         visit_stmt(cg_visit_e,cg_visit_s,env,fd->body);
+         env->current = c;
+         break;
+    }
+  }
+} 
+
+static void print_cnode(FILE @f,cgenv_t env, cnode_t n ) {
+  if(cgenv_is_visited(env,n)) return; 
+  cgenv_set_visited(env,n);
+  let str = *(*(n->fd)->name)[1]; // fun name
+  let str0 =  escape_string(str);
+  fprintf(f,"%d [label=\"%s\"];", (int) n, str0);
+  for(_ iter = n->succs; iter ; iter=iter->tl) { 
+    fprintf(f,"%d -> %d;", (int) n, (int) iter->hd);
+     print_cnode(f,env,iter->hd);
+   }
+}
+
+static void print_cg(cgenv_t env,string_t file) {
+ if(!file) return; 
+ let f  = fopen(file,"w+");
+ if(!f) env_err("Could not open %s",file);
+ let m = env->main;
+ if(!m) env_err("Main node not found");
+ fprintf(f,"digraph Program {\n");
+ print_cnode(f,env,m);
+ fprintf(f,"\n}\n");
+ fclose(f);
+}
+
+static void print_cnode_rev(FILE @f,cgenv_t env,cnode_t n) {
+  if(cgenv_is_visited(env,n)) return;
+  cgenv_set_visited(env,n);
+  let str = *(*(n->fd)->name)[1]; // fun name
+  let str0 =  escape_string(str);
+  fprintf(f,"%d [label=\"%s\"];", (int) n, str0);
+  for(_ iter = n->preds; iter ; iter=iter->tl) { 
+    fprintf(f,"%d -> %d;", (int) n, (int) iter->hd);
+     print_cnode_rev(f,env,iter->hd);
+   }
+}
+
+static void print_cg_rev(cgenv_t env,string_t file ) { 
+ if(!file) return; 
+ cgenv_reset_visited(env); // reset nodes
+ let f  = fopen(file,"w+");
+ if(!f) env_err("Could not open %s",file);
+ fprintf(f,"digraph Program {\n");
+ for(_ iter = env->leafs; iter ; iter=iter->tl) 
+    print_cnode_rev(f,env,iter->hd);
+ fprintf(f,"\n}\n");
+ fclose(f);
+ cgenv_reset_visited(env); // reset nodes
+}
+
+static void cgenv_reset_visited(cgenv_t env) {
+   env->visited = Set::empty(Core::ptrcmp); 
+}
+
+static bool cgenv_is_visited(cgenv_t env,cnode_t n) {
+  return Set::member(env->visited,n);
+}
+
+static void cgenv_set_visited(cgenv_t env, cnode_t n) {
+  env->visited = Set::insert(env->visited,n);
+}
+
+static struct CgEnv cgenv_new() {
+ let ht = Hashtable::create(33, Core::ptrcmp, hash_ptr);
+ Set::set_t<cnode_t> visited =Set::empty(Core::ptrcmp); 
+ return CgEnv(NULL,NULL,NULL,ht,visited);
+}
+
+static list_t<`a,`r> last(list_t<`a,`r> qtl ) {
+ for( ; qtl && qtl->tl != NULL;qtl=qtl->tl); // find tail
+ return qtl;
+}
+
+//static void cgenv_visit_rev(cgenv_t env, void (@`H f)(`a,fndecl_t),`a a) {
+static void cgenv_visit_rev(cgenv_t env, void (@`H f)(`a,fndecl_t),`a a) {
+ let q = List::copy(env->leafs);
+ if(!q) return; 
+ let qtl =  last(q);
+ for(_ iter = q ; iter ; iter=iter->tl) {
+   let n = iter->hd;
+   if(cgenv_is_visited(env,n)) continue;
+ 	int no_preds = List::length(n->succs); 
+	if(no_preds > n->preds_visited) {
+	  qtl->tl = new List(n,NULL);
+	  qtl = qtl->tl;
+		/* let name = *(*(n->fd)->name)[1];
+		 fprintf(stderr,"\nPLACING BACK: %s total=%d visited=%d",
+							name,no_preds,n->preds_visited);*/
+	  continue;
+	}
+	for(_ iter0=n->preds;iter0; // update succs
+		 iter0->hd->preds_visited++,iter0=iter0->tl);
+   cgenv_set_visited(env,n);
+   f(a,n->fd);
+   let q1 = List::copy(n->preds);
+   if(q1) {
+      let q1tl = last(q1);
+      qtl->tl = q1;
+      qtl = q1tl;
+   }
+ }
+ cgenv_reset_visited(env); // reset nodes
+}

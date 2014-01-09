@@ -1,0 +1,139 @@
+# The Computer Language Benchmarks Game
+# $Id: my.linux.Makefile,v 1.3 2010-03-09 20:36:50 igouy-guest Exp $
+
+# ASSUME each program will build in a clean empty tmpdir
+# ASSUME there's a symlink to the program source in tmpdir
+# ASSUME there's a symlink to the Include directory in tmpdir
+# ASSUME there are symlinks to helper files in tmpdir
+# ASSUME no responsibility for removing temporary files from tmpdir
+
+# TYPICAL actions include an initial mv to give the expected extension 
+
+# ASSUME environment variables for compilers and interpreters are set in the header
+
+
+COPTS := -O3 -fomit-frame-pointer
+
+
+
+############################################################
+# ACTIONS for specific language implementations
+############################################################
+
+
+########################################
+# Python
+########################################
+
+%.compiledpython_run: %.compiledpython $(PYTHON)
+	-mv $< $*.py
+	-$(PYTHON) -OO -c "from py_compile import compile; compile('$*.py')"
+	
+
+# (For multiprocessing make sure the extension is .py)
+# %.python_run: %.python
+#	-copy $< $*.py
+
+
+
+########################################
+# java
+########################################
+
+%.java_run: %.java $(JDKRUN)
+	-mv $< $(TEST).java
+	-$(JDKC) $(TEST).java
+
+%.javaxint_run: %.javaxint $(JDKRUN)
+	-mv $< $(TEST).java
+	-$(JDKC) $(TEST).java
+
+%.javaclient_run: %.javaclient $(JDKRUN)
+	-mv $< $(TEST).java
+	-$(JDKC) $(TEST).java
+
+
+########################################
+# gcc
+########################################
+
+COPTS += -march=i686 
+INCLUDE=
+LIB=
+
+%.c_run: %.c 
+	-$(GCC) $(COPTS) $(INCLUDE) $(LIB) -o $@ $^
+
+binary-trees.c_run: binary-trees.c
+	$(CC) $(COPTS) \
+	   -fopenmp -D_FILE_OFFSET_BITS=64 -I/usr/include/apr-1.0 \
+	   -o $@ $^ -lapr-1 -lgomp
+
+chameneos-redux.c_run: chameneos-redux.c -lpthread
+
+FANNKUCH_OPT=-O0 
+fannkuch.c_run: fannkuch.c -lpthread
+	$(CC) $(COPTS) $(FANNKUCH_OPT) -o $@ $^
+
+mandelbrot.c_run: mandelbrot.c -lpthread
+
+regex-dna.c_run: regex-dna.c
+	$(CC) $(COPTS) \
+	   -I/usr/include/glib-2.0 -I/usr/lib/glib-2.0/include/ \
+	   -I/usr/include/tcl8.4 \
+	   -o $@ $^ -lpthread -lglib-2.0 -ltcl8.4
+
+spectral-norm.c_run: spectral-norm.c -lm -lpthread
+
+thread-ring.c_run: thread-ring.c -lpthread
+
+
+########################################
+# cyc
+########################################
+
+CYCC=XINFERDIR/bin/cyclone1
+CYCFLAGS=$(COPTS) -nogc
+CYCLIB=-lpthread
+
+%.cyc_run: %.cyc
+	$(CYCC) $(CYCFLAGS) $(CYCLIB) -o $@ $^
+
+binary-trees.cyc_run: binary-trees.cyc
+
+chameneos-redux.cyc_run: chameneos-redux.cyc
+
+fannkuch.cyc_run: fannkuch.cyc
+	$(CYCC) $(CYCFLAGS) $(FANNKUCH_OPT) $(CYCLIB) -o $@ $^
+
+mandelbrot.cyc_run: mandelbrot.cyc
+
+regex-dna.cyc_run: regex-dna.cyc regex-dna_stub.o
+	$(CYCC) $(CYCFLAGS) $(CYCLIB) -o $@ $^ -lglib-2.0 -ltcl8.4
+regex-dna_stub.o: regex-dna.cyc
+	cp regex-dna.cyc tmp000.c
+	$(CC) $(COPTS) -DC_STUB \
+	   -I/usr/include/glib-2.0 -I/usr/lib/glib-2.0/include/ \
+	   -I/usr/include/tcl8.4 \
+	   -o $@ -c tmp000.c
+	rm -f tmp000.c
+
+spectral-norm.cyc_run: spectral-norm.cyc spectral-norm_stub.o -lm
+spectral-norm_stub.o:spectral-norm.cyc
+	cp spectral-norm.cyc tmp000.c
+	$(GCC) $(COPTS) $(INCLUDE) -DC_STUB -o $@ -c tmp000.c
+	rm -f tmp000.c
+
+thread-ring.cyc_run: thread-ring.cyc
+
+
+########################################
+# gpp
+########################################
+
+%.c++: %.gpp $(GXX)
+	-@mv $< $@
+
+%.gpp_run: %.c++
+	-$(GXX) -c -pipe $(COPTS) $(GXXOPTS) $< -o $<.o &&  \
+        $(GXX) $<.o -o $@ $(GXXLDOPTS) 

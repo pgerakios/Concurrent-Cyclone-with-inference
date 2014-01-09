@@ -1,0 +1,336 @@
+/* The Computer Language Benchmarks Game
+   http://shootout.alioth.debian.org/
+   Contributed by Dmitry Vyukov
+
+   Kernel thread is created for each chameneous.
+   Atomic compare-and-swap primitive is used
+   for meeting place state manipulation.
+*/
+
+//#include "cyc_include.h"
+#define xinc(x)  cap (x,1,0,0) 
+#define xdec(x)  cap (x,-1,0,0) 
+#define xlinc(x) cap (x,0,1,0)  
+#define xldec(x) cap (x,0,-1,0) 
+
+#include <stdio.h>
+#include <core.h>
+extern "C" void exit(int); 
+extern "C" int atoi(const char @);
+namespace Core {
+  int tid() @nothrow @re_entrant;
+  void flush() @nothrow @re_entrant;
+  void main_join() @nothrow; // not re-entrant because it 
+									  // should be used from the main thread
+									  // only.
+  void set_stack(unsigned) @nothrow @re_entrant;
+
+  extern "C include" {
+	  int sched_yield(void);
+		void Cyc_my_yield() {
+			 sched_yield();
+	 	}
+		void Cyc_Core_cond_wait(int @`r::X addr) {
+                     while(*addr != 1)
+			 sched_yield();
+	 	}
+
+		void Cyc_Core_cond_signal(int @`r::X addr) {
+                     *addr = 1;
+	 	}
+
+       `a::A @`r::X Cyc_Core_xsafe_cast(
+                  __nn_cyclone_internal_array_t<`a,`i,`r> arr,
+                  sizeof_t<`a> s,
+                  __cyclone_internal_singleton<`i> n,
+                  unsigned int i) {
+      if( i >= n ) exit(-1); 
+      return arr+ s*i;
+    }
+ 
+  } export {Cyc_my_yield,Cyc_Core_xsafe_cast,Cyc_Core_cond_wait,Cyc_Core_cond_signal}
+ extern `a::A @`r::X xsafe_cast(
+                     __nn_cyclone_internal_array_t<`a,`i,`r::X> arr,
+                      sizeof_t<`a> s,
+                      __cyclone_internal_singleton<`i> n, 
+                     unsigned )
+      	    	    @nothrow @re_entrant;
+ extern void cond_wait(int @`r::X addr);
+ extern void cond_signal(int @`r::X addr);
+ extern void set_lock_yield_on();
+}
+extern void my_yield();
+#define checkValueYield(x,y) my_yield(x,y)
+extern "C" void futex_wait(int @`r::X addr, int val); 
+extern "C" void wake_single(int @`r::X addr); 
+#define waitValue(x,y) futex_wait(x,y)
+#define signalValue(x,y) wake_single(x)
+
+//typedef unsigned int size_t;
+typedef unsigned int @`r uint_ptr<`r>;
+typedef enum color_t { color_blue = 0, color_red = 1, color_yellow = 2 } color;
+static char const @ color_names[] = {"blue", "red", "yellow"};
+
+color color_complement(color c1, color c2)
+  @re_entrant
+{
+  switch (c1)
+    {
+    case color_blue:
+      switch (c2)
+        {
+        case color_blue:      return color_blue;
+        case color_red:       return color_yellow;
+        case color_yellow:    return color_red;
+        default: break;
+        }
+      break;
+    case color_red:
+      switch (c2)
+        {
+        case color_blue:      return color_yellow;
+        case color_red:       return color_red;
+        case color_yellow:    return color_blue;
+        default: break;
+        }
+      break;
+    case color_yellow:
+      switch (c2)
+        {
+        case color_blue:      return color_red;
+        case color_red:       return color_blue;
+        case color_yellow:    return color_yellow;
+        default: break;
+        }
+      break;
+    default: break;
+    }
+  return 0;
+}
+
+void print_colors()
+{
+  color c1, c2, c3;
+
+  for (c1 = color_blue; c1 <= color_yellow; c1++) {
+    for (c2 = color_blue; c2 <= color_yellow; c2++) {
+      c3 = color_complement(c1, c2);
+      try {
+        printf("%s + %s -> %s\n",
+               color_names[c1], color_names[c2], color_names[c3]);
+      }
+      catch {
+      default:
+        break;
+      }
+    }
+  }
+  printf("\n");
+}
+
+char const @ spell_number(size_t n)
+  @throws(Array_bounds)
+{
+  static char                 buf [128] @zeroterm;
+  static char const @         numbers [] = {
+    " zero", " one", " two",   " three", " four",
+    " five", " six", " seven", " eight", " nine"};
+  size_t                      tokens [32];
+  size_t                      token_count;
+
+  token_count = 0;
+  do {
+    tokens[token_count] = n % 10;
+    token_count += 1;
+    n /= 10;
+  } while (n);
+
+  char *@notnull @fat pos = buf;
+  char const *@notnull @fat tok;
+  while (token_count) {
+    token_count -= 1;
+	 let z = tokens[token_count];
+    tok = numbers[z];
+  	  while (tok[0])
+      pos++[0] = tok++[0];
+  }
+  pos[0] = 0;
+  return buf;
+}
+
+#define CHAMENEOS_IDX_MASK      0xFF
+#define MEET_COUNT_SHIFT        8
+
+typedef struct chameneos_t {
+   int         count;
+   int         sameCount;
+   color volatile color;
+   int         id;
+   int         two_met;
+   int        sameid;
+} ch_t;
+
+typedef volatile struct MeetingPlace<`r::X> {
+   int meetingsLeft;
+   ch_t *`r firstCreature;
+}  mp_t<`r::X>;
+
+int Meet(region_t<`m::X> hm, mp_t<`r::X> @`m::X mp,
+         region_t<`r::X> hr, ch_t @`r::X cr)
+  @xrgn
+  @nothrow
+  @re_entrant
+{
+   int retval = 1;
+   xlinc(hm);
+   if ( mp->meetingsLeft <= 0 ) {
+      xldec(hm);
+      return 0;
+   }
+      let first = mp->firstCreature;
+      xlinc(hr);
+      if ( first == NULL )
+      {
+         cr->two_met = 0;
+         mp->firstCreature = cr;
+      }
+      else
+      {
+        let newColor = 
+                  color_complement(cr->color,first->color);
+         cr->sameid = cr->id == first->id;
+         cr->color = newColor;
+         first->sameid = cr->sameid;
+         first->color = newColor;
+         Core::cond_signal(&cr->two_met);
+         Core::cond_signal(&first->two_met);
+         //signalValue(&first->two_met,(unsigned) -1);
+         mp->firstCreature = NULL;
+         mp->meetingsLeft--;
+      }
+      xldec(hr);
+      xldec(hm);
+ return 1;
+}
+
+void chameneos_func(region_t<`m::X> hm, mp_t<`r::X> @`m mp,
+                    region_t<`r::X> hr, ch_t @`r cr)
+  @xrgn
+  @nothrow
+  @re_entrant
+{
+  xlinc(hr);
+  let val = &cr->two_met;
+  xldec(hr);
+   while (Meet(hm,mp,hr,cr)) {
+         Core::cond_wait(val);         
+         xlinc(hr);
+         if (cr->sameid)
+            cr->sameCount++;
+         cr->count++;
+         xldec(hr);
+  }
+  xdec(hm);
+  xdec(hr);
+}
+
+ch_t @{valueof(`n)} `r init_and_start(region_t<`m::X> hm, region_t<`r::X> hr, 
+				      tag_t<`n> n, color initial_colors[n],
+				      unsigned int meet_count)
+//  @ieffect( {`r,`bar1,`nat0,`H}, {`m,`bar1,`nat0,`H} )
+//  @oeffect( {`r,`bar1,`nat0,`H}, {`m,`bar1,`nat0,`H}  )
+  @xrgn
+  @throws(Bad_alloc)
+  @re_entrant
+{
+  mp_t @ `m mp = rnew(hm) MeetingPlace(meet_count,NULL);
+  ch_t @{valueof(`n)} `r c =
+    rnew(hr) { for i < n : chameneos_t{0,0,initial_colors[i], i, 0, 0} };
+  for (int i=0; i<n; i++) {
+    cap(hm,1,0,0);
+    cap(hr,1,0,0);
+    let cr = Core::xsafe_cast(c,sizeof(ch_t),n,i);
+    spawn($(hm,1,0,0),$(hr,1,0,0)) 
+            chameneos_func(hm, mp, hr,cr);
+  }
+  return c;
+}
+
+void output(region_t<`r::X> hr,
+	    tag_t<`n> n, color initial_colors[n],
+	    ch_t @{valueof(`n)} `r c)
+//  @ieffect( {`r,`bar1,`nat1} )
+//  @oeffect( {`r,`bar1,`nat1} )
+  @xrgn
+  @throws(Array_bounds)
+{
+  static char buff[128] @zeroterm;
+  unsigned int i;
+
+  for (i = 0; i < n; i++) {
+    let tmp = initial_colors[i];
+    if (tmp < numelts(color_names))
+      printf(" %s", color_names[tmp]);
+  }
+  printf("\n");
+
+  unsigned int total_meet_count = 0;
+  for (i = 0; i < n; i++) {
+    total_meet_count += c[i].count;
+    printf("%d%s\n", c[i].count, spell_number(c[i].sameCount));
+  }
+  printf("%s\n\n", spell_number(total_meet_count));
+}
+
+int main(int argc, char*@fat *@fat argv)
+  @throwsany
+{
+  Core::set_stack(32*1024);
+  Core::set_lock_yield_on();
+  color initial_colors1 [] =
+    {color_blue, color_red, color_yellow};
+  color initial_colors2 [] =
+    {color_blue, color_red, color_yellow, color_red, color_yellow,
+     color_blue, color_red, color_yellow, color_red, color_blue};
+  unsigned int meet_count = 6000000;
+
+  if (argc > 1 && atoi(argv[1]) > 0)
+    meet_count = atoi(argv[1]);
+
+  print_colors();
+
+  region h1 @ Core::heap_region;  xldec(h1);
+  region h2 @ Core::heap_region;  xldec(h2);
+  region m1 @ Core::heap_region;  xldec(m1);
+  region m2 @ Core::heap_region;  xldec(m2);
+  
+  let num1 = numelts(initial_colors1);
+  let num2 = numelts(initial_colors2);
+
+  try {
+    let c1 = init_and_start(m1, h1, num1, initial_colors1, meet_count);
+    let c2 = init_and_start(m2, h2, num2, initial_colors2, meet_count);
+
+    Core::main_join();
+
+    xlinc(h1); xlinc(h2);
+    output(h1, num1, initial_colors1, c1);
+    output(h2, num2, initial_colors2, c2);
+    xldec(h1); xldec(h2);
+  }
+  catch {
+  case &Bad_alloc:
+    break;
+  case &Array_bounds:
+    xldec(h1);
+    xldec(h2);
+    break;
+  }
+
+  xdec(m1);
+  xdec(m2);
+  xdec(h1);
+  xdec(h2);
+
+  return 0;
+}

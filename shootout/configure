@@ -1,0 +1,6 @@
+#!/bin/bash
+XINFERDIR0=$(grep CYCDIR ../Makefile.inc | cut -f2 -d'=')
+XINFERDIR=$(echo -e "$XINFERDIR0" | sed -e 's/\//\\\//g')
+
+sed 's/XINFERDIR/'$XINFERDIR'/g' bin/linuxm.template > bin/my.linux.Makefile
+sed 's/XINFERDIR/'$XINFERDIR'/g' bin/linux.template > bin/my.linux.ini

@@ -1,0 +1,232 @@
+/* The Computer Language Benchmarks Game
+   http://shootout.alioth.debian.org/
+*/
+
+#define xinc(x)  cap (x,1,0,0) 
+#define xdec(x)  cap (x,-1,0,0) 
+#define xlinc(x) cap (x,0,1,0)  
+#define xldec(x) cap (x,0,-1,0) 
+
+#include <stdio.h>
+#include <core.h>
+extern "C" exit(int); 
+namespace Core {
+  int tid() @nothrow @re_entrant;
+  void flush() @nothrow @re_entrant;
+  void main_join() @nothrow; // not re-entrant because it 
+									  // should be used from the main thread
+									  // only.
+
+
+  extern "C include" {
+    `a::A ? Cyc_Core_xmkfat(__nn_cyclone_internal_array_t<`a,`i,`r::X> arr,
+                            sizeof_t<`a> s,
+                            __cyclone_internal_singleton<`i> n) {
+      struct _fat_ptr res;
+      res.curr = arr;
+      res.base = arr;
+      res.last_plus_one = arr + s*n;
+      return res;
+    }
+    `a::A @ Cyc_Core_safecast( `a::A *p ){
+      if( p == 0 ) exit(-1);
+      return p;
+    }
+
+  } export { Cyc_Core_xmkfat , Cyc_Core_safecast}
+  extern `a?`r::X xmkfat(__nn_cyclone_internal_array_t<`a,`i,`r::X> arr,
+                      sizeof_t<`a> s, __cyclone_internal_singleton<`i> n)
+							 @nothrow @re_entrant;
+}
+
+/*extern "C include" {
+  void Cyc_waitValue(int @`r::X addr, int val) {
+      int lk_val;
+	  while((lk_val= *addr) != val )
+   	     futex_wait(addr,lk_val);
+  }
+} export{Cyc_waitValue} */
+
+//void  waitValue(int @`r::X addr, int val); 
+
+extern "C" futex_wait(volatile unsigned int @`r::X addr, int val); 
+extern "C" wake_single(volatile unsigned int @`r::X addr); 
+extern "C" int atoi(const char @);
+
+#define waitValue(x,y) futex_wait(x,y)
+#define signalValue(x,y) wake_single(x)
+
+#define      THREADS  ((unsigned int)8)
+
+void thread( region_t<`r::X> h ,
+             unsigned int times,
+             unsigned int width_bytes,
+             unsigned int id,
+             volatile unsigned int @`r::X signal,
+             unsigned int *`r::X peersignal
+             )
+//  @ieffect( {`r,`bar1,`nat0,`H} ) 
+  @xrgn
+  @nothrow  @re_entrant
+{
+  const double inverse_n = 2.0 / (double) times;
+  const int r = times % THREADS;
+  const int l = times / THREADS;
+  const int myN = l + (id < r);
+  region lh @ Core::heap_region;
+  let gN <`k> = myN;
+  let lN <`i> = myN*width_bytes ;
+  unsigned int @{valueof(`k)} lengths;
+  unsigned char @{valueof(`i)} @nozeroterm data;
+  unsigned int y,tmp;
+  try {
+    lengths = rnew(lh) {for i < gN : 0 };
+    data = rnew(lh) {for i < lN : 0 };
+    unsigned int byte_count  = 0;
+    int bit_num     = 0;
+    int byte_acc    = 0;
+    double Civ;
+    double Crv;
+    double Zrv;
+    double Ziv;
+    double Trv;
+    double Tiv;
+    int i;
+    unsigned int offset;
+    for(  y = 0 ; y < gN ; y++ ) {
+      byte_count = 0;
+      bit_num = 0;
+      byte_acc = 0;
+      unsigned int yy = y + id * l + (id < r ? id : r);
+      Civ = yy * inverse_n - 1.0;
+      offset = y * width_bytes;
+      for (int x = 0; x < times ; x++)
+        {
+          Crv = x * inverse_n - 1.5;
+          Zrv   = Crv;
+          Ziv   = Civ;
+          Trv   = Crv * Crv;
+          Tiv   = Civ * Civ;
+          i = 49;
+          do
+            {
+              Ziv = (Zrv*Ziv) + (Zrv*Ziv) + Civ;
+              Zrv = Trv - Tiv + Crv;
+
+              Trv = Zrv * Zrv;
+              Tiv = Ziv * Ziv;
+            }   while ( ((Trv + Tiv) <= 4.0) && (--i > 0) );
+
+          byte_acc <<= 1;
+          byte_acc |= (i == 0) ? 1 : 0;
+
+          if (++bit_num == 8)
+            {
+              tmp = offset + byte_count;
+              if (tmp<lN)
+                data[tmp] = (unsigned char) byte_acc;
+              byte_count++;
+              bit_num = byte_acc = 0;
+            }
+        } // end foreach (column)
+      if (bit_num != 0) // write left over bits
+        {
+          byte_acc <<= (8 - (gN & 7));
+          tmp = offset + byte_count;
+          if( tmp < lN )
+            data[tmp] = (unsigned char) byte_acc;
+          byte_count++;
+        }
+      lengths[y] = byte_count;
+    }
+  }
+  catch {
+  default:
+    xdec(lh);
+    xdec(h);
+    return;
+  }
+
+  let ft = Core::xmkfat(data,sizeof(unsigned char),lN);
+  if( peersignal != NULL ){
+    waitValue(signal,0); // wait while *woken == 0
+    xlinc(h);
+    volatile unsigned int @`r::X psig = peersignal;
+    *psig=1;
+    try {
+      for( unsigned int y = 0, tmp = 0 ; y < gN && tmp < lN ;
+           y++,tmp+=width_bytes ) {
+        fwrite(&ft[tmp], lengths[y], 1, stdout);
+      }
+    }
+    catch {
+    default:
+      break;
+    }
+    signalValue(psig,1); // signal peer
+    xldec(h);
+  }
+  else {
+    Core::main_join();
+    try {
+      for( unsigned int y = 0, tmp = 0 ; y < gN && tmp < lN ;
+             y++,tmp+=width_bytes )
+        fwrite(&ft[tmp], lengths[y], 1, stdout);
+    }
+    catch {
+    default:
+      break;
+    }
+  }
+ done:
+  xdec(lh);
+  xdec(h);
+}
+
+int main(int argc, char *@fat *@fat argv)
+{
+  if (argc != 2) exit(255);
+  unsigned int width_bytes,n;
+
+  region h @ Core::heap_region;
+  try{
+    let n = atoi(argv[1]);
+    if( n < 1 ) exit(255);
+    width_bytes = n/8;
+    if (width_bytes*8 < n)
+      width_bytes += 1;
+
+    printf("P4\n%d %d\n", n, n);
+
+    volatile unsigned int *@fat `h  signals = rnew(h) { for
+                                                        i < THREADS : 0 };
+    signals[0] = 1;
+    for( int i = 0 ; i < THREADS-1 ; i++ ){
+      volatile unsigned int @{1} `h p;
+      volatile unsigned int @{1} `h p0;
+      try {
+        p0 = &signals[i];
+        p  = &signals[i+1];
+      }
+      catch {
+      default:
+        xdec(h);
+        return -1;
+      }
+      xinc(h);
+      spawn ($(h,1,0,0)) thread(h,n,width_bytes,i,p0,p);
+    }
+    volatile unsigned int @{1} `h p0;
+      p0 = &signals[THREADS-1];
+    xldec(h);
+    thread(h,n,width_bytes,THREADS-1,p0,NULL);
+    return 0;
+  }
+  catch {
+  default:
+    xdec(h);
+    break;
+  }
+
+  return 0;
+}

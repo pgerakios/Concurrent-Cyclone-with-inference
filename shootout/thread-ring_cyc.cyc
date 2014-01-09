@@ -1,0 +1,104 @@
+/*
+ * contributed by Prodromos Gerakios
+ */
+
+//#include "cyc_include.h"
+
+#define xinc(x)  cap (x,1,0,0) 
+#define xdec(x)  cap (x,-1,0,0) 
+#define xlinc(x) cap (x,0,1,0)  
+#define xldec(x) cap (x,0,-1,0) 
+
+#include <stdio.h>
+#include <core.h>
+
+namespace Core {
+  int tid() @nothrow @re_entrant;
+  void nsleep(long) @nothrow @re_entrant;
+  void set_stack(unsigned) @nothrow @re_entrant;
+  void flush() @nothrow @re_entrant;
+  void print_xtree(region_t<`r::X>) @nothrow @re_entrant;
+  void main_join() @nothrow; // not re-entrant because it 
+									  // should be used from the main thread
+									  // only.
+  void print_region_pages(region_t<`r::X>) @nothrow @re_entrant;
+}
+
+extern "C" void futex_wait(int @`r::X addr, int val); 
+extern "C" void wake_single(int @`r::X addr); 
+extern "C" void exit(int); 
+extern "C" int atoi(const char @);
+extern "C" int setenv(const char *name, const char *value, int overwrite);
+
+#define waitValue(x,y) futex_wait(x,y)
+#define signalValue(x,y) wake_single(x)
+
+#define THREADS (503) 
+
+void thread( region_t<`r> h ,
+             volatile unsigned int @`r::X data,
+             volatile unsigned int @`r::X peerdata,
+             volatile unsigned int @`r::X woken,
+             volatile unsigned int @`r::X peerwoken,
+             unsigned int l )
+//  @ieffect( {`r,`bar1,`nat0,`H} )
+  @xrgn
+  @nothrow
+  @re_entrant
+{
+  while (1) {
+    waitValue(woken,0); // wait while *woken == 0
+    xlinc(h);
+    let cpdata = *data;
+    if (cpdata == 0){
+      printf("%i\n", l+1);
+      exit(0);
+    }
+    *peerdata = cpdata - 1;
+    *peerwoken = 1; //wake up my peer
+    *woken = 0; // go back to bed
+    signalValue(peerwoken,1); // signal peer
+    xldec(h);
+  }
+  xdec(h);
+}
+
+int main(int argc, char *@fat *@fat argv)
+  @throwsany
+{
+  Core::set_stack(Core::stack_min);
+  if (argc != 2)
+    return 1;
+
+  region h @ Core::heap_region;
+  try {
+    unsigned int @{THREADS} data = rnew(h) {for i < THREADS : 0};
+    unsigned int @{THREADS} woken = rnew(h) {for i < THREADS : 0};
+    woken[0] = 1;
+    data[0] = atoi(argv[1]);
+    unsigned int peer,i;
+
+    xldec(h);
+    for (i = 0; i < THREADS ; i++){
+      peer = (i < THREADS-1) ? i+1 : 0;        // (i+1) % THREADS;
+      try {
+        xinc(h);
+        spawn ($(h,1,0,0)) thread(h, &data[i], &data[peer], 
+			          &woken[i], &woken[peer], i);
+      }
+      catch {
+      default:
+        xdec(h);
+        break;
+      }
+    }
+    Core::main_join();
+  }
+  catch {
+  default:
+    xldec(h);
+    break;
+  }
+  xdec(h);
+  return 0;
+}

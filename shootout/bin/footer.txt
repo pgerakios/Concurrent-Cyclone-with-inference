@@ -1,0 +1,7 @@
+\hline
+\end{tabular}
+\caption{Performance overhead, compared to GCC, for benchmarks
+  taken from ``The Computer Language Benchmarks Game.''
+  All times are in seconds and memory sizes in KB.%
+  \label{tab:benchmarks}}
+\end{table}%

@@ -1,0 +1,90 @@
+#include <stdio.h>
+datatype exn  { Failure(int) };
+
+static void foo_bar(int @`r::X aa){
+  switch(*aa){
+    case 0:
+         *aa = 20;
+         break;
+    default:
+         try {
+            if(*aa = 10)
+              throw new Failure(5);
+         } catch {
+           case &Failure(i):
+                printf("lala");
+                break;
+           default:  
+                *aa = 20;
+                break; 
+         }
+         break;
+  }
+}
+
+static void worker(region_t<`r::X> h,int *`r a,int b, int c) @xrgn @nothrow @re_entrant 
+{
+      if(a) *a = 10;
+      cap(h,-1,0,0);
+//  if(ptr) *ptr = 10;
+}
+
+static void worker1(region_t<`r::X> h, region_t<`r0::X> h0) @xrgn @nothrow @re_entrant 
+{
+      cap(h0,-1,0,0);
+}
+int n= 0;
+
+ void foo1(region_t<`rzz::X> h ) @xrgn {
+   if(n) 
+      cap(h,1,3,4);
+   else {
+      cap(h,1,3,3);
+      cap(h,0,0,1);
+      { region h_foo1 @ h;
+        let f1  = rnew(h_foo1) 555;
+      }
+    }
+ } 
+ int *`r::X id( int *`r::X i) {return i; }
+
+ void foo(region_t<`r::X> h,region_t<`r0::X> h0, region_t<`H> heap) @xrgn {
+/*   cap(n?h:h,5,6,1);
+   foo1(h);
+   spawn ($(h,1,1,1),$(h0,11,12,13),$(h,14,15,16),$(h,17,18,19)) worker(h,1,2,3);
+   worker(h,1,2,3);
+   let f  = rnew(h) 5;
+   let f1  = rnew(h0) 5;
+*/
+  {  region h1 @ h0;
+     let f  = rnew(h1) 5;
+   //  foo1(h1);
+    cap(h1,1,0,0);
+    spawn ($(h1,1,1,0),$(h0,1,0,0)) worker1(h1,h0);
+//    *f = 10;
+//   cap(h,-1,0,0);
+  }
+
+  for(_ i = 0 ; i < 10 ; i++ ) {
+      if(i)
+       cap(h,1,0,1);
+      else{
+       cap(h,1,0,2);
+       cap(h,0,0,-1);
+      }
+  //    cap(h,0,0,1);
+     spawn ($(h,1,0,1)) worker(h,NULL,2,3);
+  //    *(f,f1) = *f + 10;
+      cap(h,1,0,0);
+      cap(h,-1,0,0);
+   }
+ }
+
+ void foo2() {
+ }
+
+ void foo3() {
+   foo2(); 
+ }
+
+

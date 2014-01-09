@@ -1,0 +1,84 @@
+#include <core.h>
+#include <stdio.h> 
+#include <stdlib.h> 
+
+namespace Core {
+  int tid() @nothrow @re_entrant;
+  void nsleep(long) @nothrow @re_entrant;
+  void flush() @nothrow @re_entrant;
+  void print_xtree(region_t<`r::X>) @nothrow @re_entrant;
+}
+
+#define fl Core::flush 
+#define nsleep Core::nsleep
+#define MONITOR_TIME 500000000 // 0.1 sec
+
+
+void foo( region_t<`r::X> h, int @`r::X ref,int mode) 
+ @xrgn @nothrow @re_entrant
+{ 
+  Core::print_xtree(h);
+  int i;
+  let h0 = h;
+  if(!mode){
+   //cap(h,0,0,-1);
+   for(i=0;i<1000;i++) {
+      cap(h,0,0,1);
+      fprintf(stderr,"\n[%d] Acquiring readlock",Core::tid());
+      fl();
+      fprintf(stderr,"\n[%d] Reading ref : %d", 
+              Core::tid(), *ref);
+      fl();
+      nsleep(MONITOR_TIME);
+      fprintf(stderr,"\n[%d] Releasing readlock",Core::tid());
+      cap(h,0,0,-1);
+      nsleep(MONITOR_TIME);
+     fl();
+   }
+  } else {
+   for(i=0;i<1000;i++) {
+      cap(h,0,1,0);
+      fprintf(stderr,"\n[%d] Acquired writelock",Core::tid());
+      fl();
+      let tmp = *ref;
+      *ref = i;
+      fprintf(stderr,"\n[%d] Writing ref : %d --> %d", 
+              Core::tid(),tmp, *ref);
+      fl();
+      nsleep(MONITOR_TIME);
+      fprintf(stderr,"\n[%d] Releasing writelock",Core::tid());
+      cap(h,0,-1,0);
+      nsleep(MONITOR_TIME);
+      fl();
+   }
+  }
+  cap(h0,-1,0,0);
+}
+
+int main(int argc, char *@fat *@fat argv) {
+
+ region h @ Core::heap_region;
+ try{
+   
+       let ref = rnew(h) 30;
+       fprintf(stderr,"\n[%d] Before SPAWN",Core::tid());
+       int i;
+       *ref = 25;
+       cap(h,0,-1,0);
+       for(i= 0 ; i < 2 ; i++ ) {
+          cap(h,1,0,0);
+          spawn ($(h,1,0,0)) foo(h,ref,0);    
+       }
+/*       if(argc)
+         throw new Core::Failure("lala");
+       else */
+         foo(h,ref,1); 
+  } catch {
+      case &Core::Failure(s):
+         printf("\nHello world !");
+         cap(h,-1,0,0);
+         break;
+  }
+ 
+  return 130;
+}

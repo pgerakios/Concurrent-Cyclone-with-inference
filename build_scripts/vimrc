@@ -1,0 +1,2 @@
+map <silent> <F4> :!./mk %<CR>
+map <silent> <F5> :!./mklink.sh<CR>

@@ -1,0 +1,24 @@
+
+#define XRGN
+#include <core.h> 
+int a =10;
+int main(){
+  int *`H p =&a;
+  int b = 10;
+  if(++b && --a){
+    a += b;
+    b = a -b;
+  }
+  else if( a++ || --b){
+      a = a -b;
+      let _ = malloc(5+10);
+  }
+  else return 0;
+
+  while(a--){
+      continue;
+      b--; //Test if unreachable!
+  }
+
+  return -1;
+}

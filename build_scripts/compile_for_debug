@@ -1,0 +1,1 @@
+bin/cyclone1  -save-temps -pp test2.cyc

@@ -1,0 +1,29 @@
+
+#define XRGN
+#include <core.h> 
+int a = 25;
+int f(int a,int b) { return a; }
+
+int main(){
+  int *`H p =&a;
+  int b = 10;
+  if(++b)
+  while(a--) {
+    switch(*p){
+      case 0:
+       fallthru(a?f(a+4,b+1):0);
+       int j = 10;
+       break;
+       b++;
+      case n:
+         b = b -1;
+         if(b) {
+             let z = new 5;
+         }
+         break;
+      }
+  }
+  else a++;
+  b++;
+
+}

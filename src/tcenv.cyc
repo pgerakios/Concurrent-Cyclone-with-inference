@@ -1,0 +1,930 @@
+/* Type environments.
+   Copyright (C) 2001 Greg Morrisett, AT&T
+   This file is part of the Cyclone compiler.
+
+   The Cyclone compiler is free software; you can redistribute it
+   and/or modify it under the terms of the GNU General Public License
+   as published by the Free Software Foundation; either version 2 of
+   the License, or (at your option) any later version.
+
+   The Cyclone compiler is distributed in the hope that it will be
+   useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with the Cyclone compiler; see the file COPYING. If not,
+   write to the Free Software Foundation, Inc., 59 Temple Place -
+   Suite 330, Boston, MA 02111-1307, USA. */
+
+/* An identifier can have at most one binding in each of the following:
+   1) namespaces (after "namespace" or "using")
+   2) structure tags (after "struct")
+   3) union tags (after "union")
+   4) structure or union members (after "." or "->")
+   5) datatype tags (after "datatype")
+   7) labels (after "goto", before ":")
+   8) typedef names (in types)
+   9) ordinary identifiers (the catch-all case)
+
+   The ordinary identifiers include structure tags and datatype constructors.
+
+   The environment data structures below follow from this directly.
+   Structure and union members must be resolved on a
+   per-structure/per-union basis (e.g., two structs can have members
+   with the same names) so their bindings don't belong in our environments.
+*/
+#include <string.h>
+#include "absynpp.h"
+#include "rgnorder.h"
+#include "tcutil.h"
+#include "tcenv.h"
+#include "unify.h"
+using Core;
+using List;
+using Absyn;
+//using Tcutil;
+using Absynpp;
+
+namespace Tcenv;
+
+static char  throw_annot( type_t t );
+static bool has_io_eff_annot( type_t t );
+static throws_t fn_throw_annot( type_t t );
+
+datatype exn {Env_error};
+datacon(exn,Env_error);
+
+`a env_err(string_t msg) __attribute__((noreturn)) {
+  printf("\n%s\n",msg);
+  throw &Env_error_val;
+}
+
+/////////////////////////// Type Definitions /////////////////////////////////
+
+// Type environments
+struct Tenv {
+  list_t<var_t>  ns; // current namespace
+  genv_t         ae; // absolute identifiers -- now 5 big dicts
+  struct Fenv *  le; // local environment
+  bool allow_valueof : 1;     // controls whether we allow valueof(T) in an expr
+  bool in_extern_c_include : 1;
+  bool in_tempest : 1;
+  bool tempest_generalize : 1;
+};
+
+// Global environments -- what's declared in a global scope
+struct Genv {
+  Dict::dict_t<qvar_t,aggrdecl_t@> aggrdecls;
+  Dict::dict_t<qvar_t,datatypedecl_t@> datatypedecls;
+  Dict::dict_t<qvar_t,enumdecl_t@>   enumdecls;
+  // no indirection b/c no redeclaration
+  Dict::dict_t<qvar_t,typedefdecl_t> typedefs;
+  // bool for tree-shaking, binding_t for interface.cyc (FIX)
+  Dict::dict_t<qvar_t,$(binding_t,bool)@> ordinaries;
+};
+
+typedef $(switch_clause_t, list_t<tvar_t>, list_t<type_t>) const * ftclause_t;
+
+// This part is shared throughout type-checking of a function.
+// Hence mutations are seen by all subsequent type-checking, which is easier
+// than threading labels which must be function-wide unique anyway.
+static struct SharedFenv {
+  type_t   return_typ;
+  list_t<$(type_t,type_t,RgnOrder::rgn_po_t,seg_t)@> delayed_effect_checks;
+  list_t<$(RgnOrder::rgn_po_t,list_t<$(type_t,type_t)@>,seg_t)@> delayed_constraint_checks;
+};
+
+// flags for local function environments
+struct FenvFlags {
+  enum NewStatus in_new;
+  bool in_notreadctxt : 1; // true when in an exp that might read
+  bool in_lhs : 1;         // true when we're in a lhs exp
+  bool abstract_ok : 1;    // true when an expression can be abstract
+  bool in_stmt_exp : 1;    // true when in a statement-expression ({ s })
+  bool is_io_eff_annot:1;
+  unsigned char is_throw_annot:2; // 0 = no annot 
+								 // 1 = @nothrow, 2 = @throw , 3 = @throwany
+  unsigned char is_reentrant:1; // 0 = no , 1 = yes
+};
+
+typedef list_t<qvar_t,`H> qvlist_t;
+typedef list_t<qvlist_t,`H> qscope_t;
+
+// Local function environments -- local variables are already bound
+abstract struct Fenv { //IMPORTANT!
+  struct SharedFenv @ shared;
+  list_t<tvar_t>      type_vars; //type variables that can occur free
+  RgnOrder::rgn_po_t            region_order; // partial order on region variables
+  ftclause_t          ctrl_env;
+  type_t              capability;
+  type_t              curr_rgn;   // current block's region
+  struct FenvFlags    flags;
+  qscope_t				 *`H throws; // inferred exceptions
+  throws_t				 annot; //throws annotation
+  seg_t					 loc;	  // location of this function in .cyc file
+};
+
+//////////////////////// Top-level Environment Manipulation //////////////////
+tenv_t tc_init() {
+  // Set up initial environment so that datatype exn, etc. is defined
+  let ae = new Genv{.aggrdecls     = Dict::empty(qvar_cmp),
+		    .datatypedecls = Dict::empty(qvar_cmp),
+		    .enumdecls     = Dict::empty(qvar_cmp),
+		    .typedefs      = Dict::empty(qvar_cmp),
+		    .ordinaries    = Dict::empty(qvar_cmp)};
+  ae->datatypedecls = Dict::insert(ae->datatypedecls, exn_name, new exn_tud());
+  return new Tenv(NULL,ae,NULL,false,false,false,false);
+}
+binding_t lookup_ordinary_global(tenv_t te,seg_t loc,qvar_t q,bool is_use) {
+  let ans = Dict::lookup(te->ae->ordinaries, q);
+  if(is_use)
+    (*ans)[1] = true;
+  return (*ans)[0];
+}
+aggrdecl_t @ lookup_aggrdecl(tenv_t te,seg_t loc,qvar_t q) {
+  return Dict::lookup(te->ae->aggrdecls, q);
+}
+datatypedecl_t @ lookup_datatypedecl(tenv_t te,seg_t loc,qvar_t q) {
+  return Dict::lookup(te->ae->datatypedecls, q);
+}
+datatypedecl_t@*`r lookup_xdatatypedecl(region_t<`r> r, tenv_t te,seg_t loc,qvar_t q) {
+  return rnew(r) Dict::lookup(te->ae->datatypedecls, q);
+}
+enumdecl_t @lookup_enumdecl(tenv_t te, seg_t loc, qvar_t q) {
+  return Dict::lookup(te->ae->enumdecls, q);
+}
+typedefdecl_t lookup_typedefdecl(tenv_t te, seg_t loc, qvar_t q) {
+  return Dict::lookup(te->ae->typedefs, q);
+}
+
+//////////////////// Function Environment Manipulation //////////////////////
+
+static bool check_fenv(tenv_t te) 
+{ 
+   return (te->le != NULL);
+}
+
+static fenv_t get_fenv(tenv_t te, const char ?err_msg) { //IMPORTANT!
+  let le = te->le;
+  if (le == NULL) env_err(err_msg);
+  return (fenv_t)le;
+}
+static tenv_t put_fenv(tenv_t te, fenv_t fe) { //SET LE
+  if (te->le == NULL) env_err("put_fenv"); // DJG: unnecessary but okay
+  let ans = new *te;
+  ans->le = fe;
+  return ans;
+}
+static tenv_t put_emptyfenv(tenv_t te) {
+  let ans = new *te;
+  ans->le = NULL;
+  return ans;
+}
+
+type_t return_typ(tenv_t te) {
+  return get_fenv(te,"return_typ")->shared->return_typ;
+}
+
+list_t<tvar_t> lookup_type_vars(tenv_t te) {
+  let le = te->le;
+  if(te->le == NULL) return NULL;
+  return le->type_vars;
+}
+
+opt_t<list_t<tvar_t>> lookup_opt_type_vars(tenv_t te) {
+  return new Opt(lookup_type_vars(te));
+}
+
+tenv_t add_type_vars(seg_t loc,tenv_t te, list_t<tvar_t> tvs) {
+  let fe = new *get_fenv(te,"add_type_vars");
+  Tcutil::add_tvar_identities(tvs);
+  let new_tvs = append(tvs,fe->type_vars);
+  Tcutil::check_unique_tvars(loc,new_tvs); // DJG: wasteful, old were unique
+  fe->type_vars = new_tvs;
+  return put_fenv(te,fe);
+}
+
+tenv_t set_new_status(enum NewStatus status, tenv_t te){
+  let le = te->le;
+  if(le == NULL) return put_emptyfenv(te);
+  let ans = new *le;
+  ans->flags.in_new = status;
+  return put_fenv(te,ans);
+}
+enum NewStatus new_status(tenv_t te) {
+  let le = te->le;
+  if (le == NULL) return NoneNew;
+  return le->flags.in_new;
+}
+bool abstract_val_ok(tenv_t te) {
+  let le = te->le;
+  if (le == NULL) return false;
+  return le->flags.abstract_ok;
+}
+tenv_t enter_abstract_val_ok(tenv_t te){
+  let le = te->le;
+  if(le == NULL) return put_emptyfenv(te);
+  let ans = new *le;
+  ans->flags.abstract_ok = true;
+  return put_fenv(te,ans);
+}
+tenv_t clear_abstract_val_ok(tenv_t te) {
+  let le = te->le;
+  if(le == NULL) return put_emptyfenv(te);
+  let ans = new *le;
+  ans->flags.abstract_ok = false;
+  return put_fenv(te,ans);
+}
+tenv_t enter_notreadctxt(tenv_t te){
+  let le = te->le;
+  if(le == NULL) return put_emptyfenv(te);
+  let ans = new *le;
+  ans->flags.in_notreadctxt = true;
+  return put_fenv(te,ans);
+}
+tenv_t clear_notreadctxt(tenv_t te) {
+  let le = te->le;
+  if(le == NULL) return put_emptyfenv(te);
+  let ans = new *le;
+  ans->flags.in_notreadctxt = false;
+  return put_fenv(te,ans);
+}
+bool in_notreadctxt(tenv_t te) {
+  let le = te->le;
+  if (le == NULL) return false;
+  return le->flags.in_notreadctxt;
+}
+tenv_t enter_lhs(tenv_t te){
+  let le = te->le;
+  if(le == NULL) return put_emptyfenv(te);
+  let ans = new *le;
+  ans->flags.in_lhs = true;
+  return put_fenv(te,ans);
+}
+tenv_t clear_lhs(tenv_t te) {
+  let le = te->le;
+  if(le == NULL) return put_emptyfenv(te);
+  let ans = new *le;
+  ans->flags.in_lhs = false;
+  return put_fenv(te,ans);
+}
+bool in_lhs(tenv_t te) {
+  let le = te->le;
+  if (le == NULL) return false;
+  return le->flags.in_lhs;
+}
+tenv_t enter_stmt_exp(tenv_t te) {
+  let le = te->le;
+  if(le == NULL) return put_emptyfenv(te);
+  let ans = new *le;
+  ans->flags.in_stmt_exp = true;
+  return put_fenv(te,ans);
+}
+bool in_stmt_exp(tenv_t te) {
+  let le = te->le;
+  if (le == NULL) return false;
+  return le->flags.in_stmt_exp;
+}
+
+// do not stop setting clauseopt -- JumpAnalysis needs it!
+$(switch_clause_t,list_t<tvar_t>,list_t<type_t>)const* const
+process_fallthru(tenv_t te,stmt_t s, switch_clause_t *@ clauseopt){
+  let ans = get_fenv(te,"process_fallthru")->ctrl_env;
+  if(ans != NULL)
+    *clauseopt = new (*ans)[0];
+  return ans;
+}
+
+tenv_t set_fallthru(tenv_t te, list_t<tvar_t,`H> new_tvs, list_t<vardecl_t> vds,
+		    switch_clause_t clause) {
+  list_t<type_t> ft_typ = NULL;
+  for(; vds!=NULL; vds=vds->tl)
+    ft_typ = new List(vds->hd->type,ft_typ);
+  let new_ctrl_env = new $(clause,new_tvs,imp_rev(ft_typ));
+  let new_fe = new *get_fenv(te,"set_fallthru");
+  new_fe->ctrl_env = new_ctrl_env;
+  return put_fenv(te,new_fe);
+}
+// fallthru is illegal in the last case
+tenv_t clear_fallthru(tenv_t te) {
+  fenv_t fe = new *get_fenv(te,"clear_fallthru");
+  fe->ctrl_env = NULL;
+  return put_fenv(te,fe);
+}
+
+tenv_t allow_valueof(tenv_t te) {
+  let fe = (te->le==NULL) ? NULL : new *te->le;
+  let ans = new *te;
+  ans->allow_valueof = true;
+  return ans;
+}
+tenv_t enter_extern_c_include(tenv_t te) {
+  let fe = (te->le==NULL) ? NULL : new *te->le;
+  let ans = new *te;
+  ans->in_extern_c_include = true;
+  return ans;
+}  
+tenv_t enter_tempest(tenv_t te) {
+  let fe = (te->le==NULL) ? NULL : new *te->le;
+  let ans = new *te;
+  ans->in_tempest = true;
+  return ans;
+}
+tenv_t clear_tempest(tenv_t te) {
+  let fe = (te->le==NULL) ? NULL : new *te->le;
+  let ans = new *te;
+  ans->in_tempest = false;
+  return ans;
+}
+bool in_tempest(tenv_t te) {
+  return te->in_tempest;
+}
+tenv_t add_region(tenv_t te, type_t rgn, bool opened) { //TODO
+  let ans = new *get_fenv(te,"add_region");
+  let c = Tcutil::compress(rgn);
+  let region_order = ans->region_order;
+  if( !Absyn::is_xrgn(c) )
+  {
+	  switch (c) {
+		  case &VarType(x): 
+		    region_order = RgnOrder::add_youngest(region_order, x, opened);
+		    break;
+		  default: break;
+	  }
+	  ans->capability   = join_eff(new List(access_eff(rgn),
+								   new List(ans->capability,NULL)));
+  }
+  else
+  {   //PG: add dummy effect
+	   switch (c) {
+		  case &VarType(x): 
+			region_order = RgnOrder::add_unordered(region_order,x);
+		    break;
+		  default: break;
+		}
+	   ans->capability   = join_eff(new List(caccess_eff_dummy(rgn),
+								   new List(ans->capability,NULL)));
+  }
+  ans->region_order = region_order;
+  return put_fenv(te,ans);
+}
+
+tenv_t new_named_block(seg_t loc, tenv_t te, tvar_t block_rgn) {
+  let ans = new *get_fenv(te,"new_named_block");
+  let block_typ = new VarType(block_rgn);
+  ans->type_vars = new List(block_rgn, ans->type_vars);
+  Tcutil::check_unique_tvars(loc, ans->type_vars); // DJG: FIX -- very wasteful
+  ans->region_order = RgnOrder::add_youngest(ans->region_order, block_rgn, false);
+  ans->capability = join_eff(new List(access_eff(block_typ), 
+					 new List(ans->capability,NULL)));
+  ans->curr_rgn = block_typ;
+  return put_fenv(te,ans);
+}
+
+static datatype KindBound.Eq_kb rgn_kb = Eq_kb(&Tcutil::rk);
+
+tenv_t new_block(seg_t loc, tenv_t te) { //TODO
+  tvar_t t = Tcutil::new_tvar(&rgn_kb);
+  Tcutil::add_tvar_identity(t);
+  //printf("\nNEW_BLOCK: new tvar %s\n", Absynpp::tvar2string(t));
+  return new_named_block(loc, te, t);
+}
+
+//adds the second parameter which is a map from parent to child regions to the "outlives" (rgnorder.cyc)
+// dictionary (ans->region_order). Thus, it appends the second parameter (map) to the environment's map
+// of parent to child regions
+tenv_t new_outlives_constraints(tenv_t te, 
+										  list_t<$(type_t,type_t)@> cs,
+										  seg_t loc) 
+{
+  let ans = new *get_fenv(te,"new_outlives_constraints");
+  for(; cs != NULL; cs = cs->tl)
+    ans->region_order =
+      RgnOrder::add_outlives_constraint(ans->region_order,(*cs->hd)[0],(*cs->hd)[1], loc);
+  return put_fenv(te,ans);
+}
+// convert parent xrgn to normal hrm
+tenv_t new_outlives_constraint_special(tenv_t te,type_t child, type_t xparent ){
+  let ans = new *get_fenv(te,"new_outlives_constraint_special");
+  ans->region_order = RgnOrder::add_outlives_constraint_special
+													(ans->region_order,xparent,child);
+  return put_fenv(te,ans);
+}
+
+tenv_t add_region_equality(tenv_t te, type_t r10 , type_t r20,
+			   $(tvar_t,kindbound_t) * @oldtv,
+			   seg_t loc) {
+  // we add outlives constraints and refine the kind of the type variable
+  let r1 = Tcutil::compress(r10);
+  let r2 = Tcutil::compress(r20);
+  let r1k = Tcutil::type_kind(r1);
+  let r2k = Tcutil::type_kind(r2);
+
+  // first do kind refinement
+  bool r1_le_r2 = Tcutil::kind_leq(r1k,r2k);
+  bool r2_le_r1 = Tcutil::kind_leq(r2k,r1k);
+  if (!r1_le_r2 && !r2_le_r1) {
+    Tcutil::terr(loc,"Cannot compare region handles for %s and %s\n  kinds %s and %s are not compatible\n",
+	 typ2string(r1),typ2string(r2),kind2string(r1k),kind2string(r2k));
+    return new_outlives_constraints(te,NULL,loc);
+  }
+  else if (r1_le_r2 && !r2_le_r1)
+    *oldtv = new Tcutil::swap_kind(r2,Tcutil::kind_to_bound(r1k));
+  else if (!r1_le_r2 && r2_le_r1)
+    *oldtv = new Tcutil::swap_kind(r1,Tcutil::kind_to_bound(r2k));
+
+  // now update the outlives constraints
+  let bds = NULL;
+  if (r1 != heap_rgn_type && r1 != unique_rgn_type && r1 != refcnt_rgn_type)
+    bds = new List(new $(access_eff(r1),r2),bds);
+  if (r2 != heap_rgn_type && r2 != unique_rgn_type && r2 != refcnt_rgn_type)
+    bds = new List(new $(access_eff(r2),r1),bds);
+  return new_outlives_constraints(te,bds,loc);
+}
+
+type_t get_capability( tenv_t te )
+{
+  fenv_t fe = get_fenv(te,"get_capability");
+  return fe->capability;
+}
+
+// Current block's region
+type_t curr_rgn(tenv_t te) 
+{
+  let le = te->le;
+  if (le == NULL) return heap_rgn_type;
+  return le->curr_rgn;
+}
+
+// return  parent \mapsto children dictionary
+static RgnOrder::rgn_po_opt_t curr_rgnpo(tenv_t te) 
+{
+  let le = te->le;
+  if(le == NULL) return NULL;
+  return le->region_order;
+}
+
+// Check that rgn_typ is currently accessible:  the heap region is always
+// accessible, and a region variable r is accessible if it appears in the
+// capability
+void check_rgn_accessible(tenv_t te, seg_t loc, type_t rgn) 
+{ //IMPORTANT! TODO
+  fenv_t fe = get_fenv(te,"check_rgn_accessible");
+  if ((Tcutil::region_in_effect(false, rgn, fe->capability)) ||
+      (Tcutil::region_in_effect(true, rgn, fe->capability)))
+  {
+    return;
+  }
+  if(RgnOrder::eff_outlives_eff(fe->region_order,access_eff(rgn),fe->capability))
+  {
+    return;
+  }
+  Tcutil::terr(loc, "Expression accesses unavailable region %s", typ2string(rgn));
+}
+
+// Check that a function call's effect is contained in the current capability.
+// Do not constrain evars -- delay the check instead.
+void check_effect_accessible(tenv_t te, seg_t loc, type_t eff) 
+{ //TODO
+  let &Fenv{.capability = capability, .region_order = ro,
+            .shared = shared, ...} = get_fenv(te,"check_effect_accessible");
+  if(Tcutil::subset_effect(false, eff, capability))
+    return;
+  if(RgnOrder::eff_outlives_eff(ro, eff, capability))
+    return;
+  shared->delayed_effect_checks =
+    new List (new $(capability,eff,ro,loc), shared->delayed_effect_checks);
+}
+
+void check_delayed_effects(tenv_t te) 
+{
+   let checks = get_fenv(te,"check_delayed_constraints")->shared->delayed_effect_checks;
+   for(; checks != NULL; checks = checks->tl) 
+	{
+     let &$(capability,eff,rgn_order,loc) = checks->hd;
+     if(Tcutil::subset_effect(true, eff, capability))   continue;
+     if(RgnOrder::eff_outlives_eff(rgn_order, eff, capability))  continue;
+     Tcutil::terr(loc, "Capability \n%s\ndoes not cover function's effect\n%s", typ2string(capability), typ2string(eff));
+   }
+}
+
+// Check that a function call's region partial order is compatible
+// with the current region partial order
+// Do not constrain evars -- delay the check instead.
+// FIX: better error message!
+
+//COMMENTEDOUT
+void check_rgn_partial_order(tenv_t te, seg_t loc,
+                             list_t<$(type_t,type_t)@`H,`H> po) 
+{
+  let le = te->le;
+  if(le == NULL) 
+  {
+    // not sure this could ever fail
+    for(; po != NULL; po=po->tl)
+      if((!Tcutil::subset_effect(true, (*po->hd)[0], empty_effect))
+	 || !Tcutil::subset_effect(true, access_eff((*po->hd)[1]), empty_effect))
+	 Tcutil::terr(loc,"the required region ordering is not satisfied here");
+    return;
+  }
+  let &Fenv{.region_order = ro, .shared = shared, ...} = (fenv_t)le;
+  if(!RgnOrder::satisfies_constraints(ro,po,heap_rgn_type,false))
+    shared->delayed_constraint_checks =
+      new List(new $(ro,po,loc), shared->delayed_constraint_checks);
+}
+
+void check_delayed_constraints(tenv_t te) {
+  let checks = 
+    get_fenv(te,"check_delayed_constraints")->shared->delayed_constraint_checks;
+  for(; checks != NULL; checks = checks->tl) {
+    let &$(rgn_order,po,loc) = checks->hd;
+    if(!RgnOrder::satisfies_constraints(rgn_order,po,heap_rgn_type,true))
+      Tcutil::terr(loc,"the required region ordering is not satisfied here");
+  }
+}
+
+static struct SharedFenv @`H new_shared_fenv(type_t ret) {
+  return new SharedFenv{.return_typ = ret,
+			.delayed_effect_checks = NULL,
+			.delayed_constraint_checks = NULL };
+}
+
+type_t new_capability( type_t param_rgn , 
+							  fndecl_t fd,
+							  type_t   fntype )
+{
+	return join_eff(new List(access_eff(param_rgn),
+						 new List((type_t)fd->i.effect,NULL)));
+}
+
+///////////////////////////////////////
+
+tenv_t new_fenv_in_env(seg_t loc, tenv_t te, fndecl_t fd,type_t ftyp) {
+  tvar_t rgn0 =
+    new Tvar(new ((string_t)aprintf("`%s",*(*fd->name)[1])),
+             Tcutil::new_tvar_id(), &rgn_kb);
+  let tvs = new List(rgn0,fd->i.tvars);
+  Tcutil::check_unique_tvars(loc,tvs);
+//   fprintf(stderr,"checking fn %s\n",qvar2string(fd->name));
+  let rgn_po = RgnOrder::initial_fn_po(fd->i.tvars,fd->i.rgn_po, (type_t)fd->i.effect,rgn0,loc);
+  type_t param_rgn = new VarType(rgn0);
+  for(let vds = fd->param_vardecls->v; vds != NULL; vds = vds->tl) 
+    vds->hd->rgn = param_rgn;
+  if (fd->i.cyc_varargs != NULL) {
+    let VarargInfo(n,tq,t,i) = *fd->i.cyc_varargs;
+    // name-resolution did not set param_rgn for the cyc_varargs array
+    for(let vds = fd->param_vardecls->v; vds != NULL; vds = vds->tl) {
+      let vd = vds->hd;
+      if(strptrcmp((*vd->name)[1], (var_t)n)==0) {
+	vd->type = fatptr_type(t, param_rgn, tq, false_type);
+	break;
+      }
+    }
+  }
+  let fenv = new
+    Fenv{.shared = new_shared_fenv(fd->i.ret_type),
+         .type_vars   = tvs,
+         .region_order = rgn_po,
+         .ctrl_env    = NULL,
+         .capability  = new_capability(param_rgn,fd,ftyp),
+         .curr_rgn    = param_rgn,
+		   .flags       = FenvFlags{NoneNew,false,false,false,false,
+											 has_io_eff_annot(ftyp),
+											 throw_annot(ftyp),
+											 (unsigned char )
+											Absyn::is_reentrant(fd->i.reentrant)
+											},
+			.throws		 = new NULL,
+		   .annot = fn_throw_annot(ftyp),
+			.loc = loc
+       };
+  return new Tenv{te->ns, te->ae, fenv, false, false,
+						   te->in_tempest, te->tempest_generalize};
+}
+
+bool is_reentrant_fun(tenv_t tenv )
+{
+  let le = tenv->le;
+  if (le == NULL) return false;
+  return	le->flags.is_reentrant;
+}
+
+fenv_t nested_fenv(seg_t loc, fenv_t old_fenv, fndecl_t fd, type_t ftyp) {
+ //This function is used for constructing a new environment 
+  // when checking a function body
+  let &Fenv{.region_order = rgn_po,
+            .type_vars = type_vars, .shared = shared, ...} = old_fenv;
+  tvar_t rgn0 =
+    new Tvar(new ((string_t)aprintf("`%s",*(*fd->name)[1])),
+             Tcutil::new_tvar_id(), &rgn_kb);
+  for (let tvars = fd->i.tvars; tvars != NULL; tvars = tvars->tl) {
+    let &Kind(k,a) = Tcutil::tvar_kind(tvars->hd,&Tcutil::bk);
+    if (k == RgnKind)
+      if (a == Aliasable)
+	rgn_po = RgnOrder::add_unordered(rgn_po, tvars->hd);
+      else
+	Tcutil::impos("non-intuitionistic tvar in nested_fenv");
+  }
+  rgn_po = RgnOrder::add_youngest(rgn_po, rgn0, false);
+  for(let po2 = fd->i.rgn_po; po2 != NULL; po2=po2->tl)
+    rgn_po = RgnOrder::add_outlives_constraint(rgn_po,(*po2->hd)[0],(*po2->hd)[1],loc);
+  let tvs = new List(rgn0,append(fd->i.tvars,type_vars));
+  Tcutil::check_unique_tvars(loc,tvs);
+  type_t param_rgn = new VarType(rgn0);
+  for(let vds = fd->param_vardecls->v; vds != NULL; vds = vds->tl)
+    vds->hd->rgn = param_rgn;
+  if (fd->i.cyc_varargs != NULL) {
+    let VarargInfo(n,tq,t,i) = *fd->i.cyc_varargs;
+    // name-resolution did not set param_rgn for the cyc_varargs array
+    for(let vds = fd->param_vardecls->v; vds != NULL; vds = vds->tl) {
+      let vd = vds->hd;
+      if(strptrcmp((*vd->name)[1], (var_t)n)==0) {
+	vd->type = fatptr_type(t, param_rgn, tq, false_type);
+	break;
+      }
+    }
+  }
+  return new
+    Fenv{.shared = new_shared_fenv(fd->i.ret_type),
+         .type_vars   = tvs,
+         .region_order = rgn_po,
+         .ctrl_env    = NULL,
+         .capability  = new_capability(param_rgn,fd,ftyp),
+         .curr_rgn    = param_rgn,
+		   .flags       = FenvFlags{NoneNew,false,false,false,false,
+											 has_io_eff_annot(ftyp),
+											 throw_annot(ftyp),
+											 (unsigned char )
+											 Absyn::is_reentrant(fd->i.reentrant)
+											},
+			.throws		 = new NULL,
+		   .annot = fn_throw_annot(ftyp),
+			.loc = loc
+       };
+}
+
+tenv_t new_bogus_fenv_in_env(tenv_t te, type_t ret_type,
+		  list_t<$(var_opt_t,tqual_t,type_t)@> args) {
+  tvar_t rgn0 = new Tvar(new "bogus", Tcutil::new_tvar_id(), &rgn_kb);
+  let tvs = new List(rgn0,NULL);
+  let rgn_po = RgnOrder::initial_fn_po(NULL,NULL,join_eff(NULL),rgn0,0);
+  type_t param_rgn = new VarType(rgn0);
+  let fenv = new
+    Fenv{.shared = new_shared_fenv(ret_type),
+         .type_vars   = tvs,
+         .region_order = rgn_po,
+         .ctrl_env    = NULL,
+         .capability  = join_eff(new List(access_eff(param_rgn),NULL)),
+         .curr_rgn    = param_rgn,
+		   .flags       = FenvFlags{NoneNew,false,false,false,false,
+										    false,0,false
+											},
+			.throws		 = new NULL,
+		   .annot = NULL,								 
+			.loc = 0
+       };
+   return  new Tenv{te->ns, te->ae, fenv, true,
+							 te->in_extern_c_include, te->in_tempest,
+							 te->tempest_generalize};
+}
+
+
+bool rgn_outlives_rgn(tenv_t te, type_t rgn1, type_t rgn2)
+{
+  return RgnOrder::rgn_outlives_rgn(curr_rgnpo(te),rgn1,rgn2);
+}
+/////////////////////////////////////////////////////////////////
+static fn_info_t fn_type( type_t t )
+{
+ switch(t)
+ {
+  case &FnType(i): return i;
+  default:	 env_err("Tcenv::fn_type");
+
+ }	
+}
+
+
+static throws_t fn_throw_annot( type_t t )
+{
+  return fn_type(t).throws;
+}
+
+static bool has_io_eff_annot( type_t t )
+{
+  return fn_type(t).ieffect != NULL;
+}
+
+static char throw_annot( type_t t )
+{
+   let x =  fn_throw_annot(t);
+	if( x == NULL ) return 0;
+	else if( is_nothrow(x) ) return 1;
+	else if( is_throwsany(x) ) return 3;
+	else return 2;
+}
+
+/*
+void add_exception(tenv_t te,  type_t t )
+{
+	switch(Tcutil::compress(t))
+	{
+		case &PointerType(PtrInfo{t1,...}):
+			t1 = Tcutil::compress(t1);
+			switch(t1)
+			{
+			  case  &AppType(&DatatypeFieldCon(tuf_info),ts):
+			    switch(tuf_info) 
+				 {
+				    case {.UnknownDatatypefield = UnknownDatatypeFieldInfo(tname,fname,is_x)}:
+					      fallthru(tname,is_x,fname);
+				    case {.KnownDatatypefield = $(&Datatypedecl(_,tname,_,_,is_x),
+            			 &Datatypefield(fname,_,_,_))}:
+							  let fenv =  get_fenv(te,"Tcenv::add_exception");
+							  //printf("\nADDING %s\n",Absynpp::qvar2string(fname));
+							  (*fenv->throws)->hd = add_qvar((*fenv->throws)->hd,fname);
+   			 } 
+				 break;			
+			  case  &AppType(&DatatypeCon(_),_): break; //return true;
+			  default: break; 
+
+		  }
+		 break;
+  		 default: break;
+	}
+   //return true;
+}
+
+static void print_qvlist( qvlist_t in, string_t msg )
+{
+  printf("\nPrinting %s:\n",msg);
+  for( ; in != NULL ; in = in->tl )
+		 printf("\n %s",Absynpp::qvar2string(in->hd));
+  printf("\n");
+}
+
+
+// @requires a stack of at least three items
+void calculate_throws_and_pop
+(seg_t loc, tenv_t te ,    datatype Tcpat::Decision @`H d )
+{
+	let throws = (get_fenv(te,"Tcenv::calculate_throws_and_pop")->throws);
+   let $(scatch,stry) = $((*throws)->hd,(*throws)->tl->hd);
+//	print_qvlist(stry,"STRY");
+//	print_qvlist(scatch,"SCATCH");
+//	print_exn_scopes(te,"BEFORE POP");
+	pop_throws_scope(te);pop_throws_scope(te); // pop twice
+//	print_exn_scopes(te,"AFTER POP");
+	let uncaught =  Absyn::uncaught_exn(loc,d,stry,scatch);
+//	print_qvlist(uncaught,"--> uncaught --->");
+	 throws = get_fenv(te,"Tcenv::calculate_throws_and_pop")->throws;
+	for( ; uncaught != NULL ; uncaught = uncaught->tl ) //merge with env
+		(*throws)->hd = Absyn::add_qvar((*throws)->hd,uncaught->hd);
+	//print_exn_scopes(te,"AFTER ADDING VARS");
+}
+/////////////////////////////////////////////////////////////
+void print_exn_scope( tenv_t te, string_t s )
+{
+	let fenv = get_fenv(te,"Tcenv::print_exn_scope");
+	let iter= (*fenv->throws)->hd;
+   int cnt = 0;
+	printf("\n%s scope:\n",s);
+	for(  ; iter != NULL ; iter = iter->tl )
+	{
+//		let it = iter->hd;
+	//   for( ; it != NULL ; it = it->tl )
+		{
+			printf("%s,", qvar2string(iter->hd));
+		}
+		//printf("\n");
+	}
+	printf("\n");
+}
+
+void print_exn_scopes( tenv_t te, string_t s )
+{
+	let fenv = get_fenv(te,"Tcenv::print_exn_scopes");
+	let iter= *(fenv->throws);
+   int cnt = 0;
+	printf("\n^^^^Fenv addr : %p" ,fenv);
+	for(  ; iter != NULL ; iter = iter->tl )
+	{
+		printf("\n===> %s scope (%d) : ",s ,++cnt);
+		let it = iter->hd;
+	   for( ; it != NULL ; it = it->tl )
+		{
+			printf("%s,", qvar2string(it->hd));
+		}
+		printf("\n");
+	}
+	printf("\n");
+}
+
+///////////////////////////////////////////////////////////
+////////////////////////////////////////
+void push_throws_scope( tenv_t te  )
+{
+	let fenv = get_fenv(te,"Tcenv::push_throws_scope");
+ 	*(fenv->throws) = new List(NULL,*fenv->throws);
+}
+
+static void check_throws_validity(tenv_t te);
+
+void pop_throws_scope( tenv_t te )
+{
+  	let fenv = get_fenv(te,"Tcenv::pop_throws_scope");
+	if( *fenv->throws == NULL ) env_err("Tcenv::pop_throws_scope");
+  else
+  {
+	 if( (*fenv->throws)->tl == NULL ) check_throws_validity(te);
+	 *fenv->throws = (*fenv->throws)->tl;
+  }
+}
+
+bool has_io_eff( tenv_t te )
+{
+  let fenv = get_fenv(te,"Tcenv::has_io_eff");
+  return fenv->flags.is_io_eff_annot;
+
+}
+
+bool has_throw_eff( tenv_t te )
+{
+  let fenv = get_fenv(te,"Tcenv::has_throw_eff");
+  return fenv->flags.is_throw_annot;
+}
+
+void add_throws(seg_t loc, tenv_t te,  type_t t )
+{
+  if( !has_io_eff(te) &&  !has_throw_eff(te) ) return;
+  let iter = fn_throw_annot(t);
+  let fenv = NULL;
+  if( iter == NULL ) 
+  {
+    fenv =  get_fenv(te,"Tcenv::add_throws");
+	 if( fenv->flags.is_throw_annot  != 3  ) //don't care if @throwsany
+     Tcutil::terr(loc, "Attempted to invoke a function that does not have @throws annotation. This action is disallowed in the current context.");
+  }
+  else  fenv =  get_fenv(te,"Tcenv::add_throws");
+  if( is_nothrow(iter) ) return; //nothing to do
+  // if( is_throwsany(iter)) just add __any__
+  //printf("\nADDING %s\n",Absynpp::qvar2string(fname));
+  for( ; iter != NULL ; iter = iter->tl )
+  {
+   (*fenv->throws)->hd = add_qvar((*fenv->throws)->hd,throws_hd2qvar(iter));
+  }
+ //print_exn_scopes(te,"Adding function");
+}
+
+static string_t q2string( qvar_t q )
+{
+ static qvar_opt_t any = NULL;
+  if(!any) any =  throws_hd2qvar(throwsany());
+  
+  if( strptrcmp((*any)[1],(*q)[1]) == 0 )  return "<any exception>";
+  else return Absynpp::qvar2string(q);
+}
+
+static string_t qvl2string( list_t<qvar_t,`H> l )
+{
+  if( l == NULL ) return "";
+  let x = aprintf("{%s", q2string(l->hd));
+  for( l = l->tl  ; l != NULL ; l = l->tl )
+  {
+		 x = aprintf("%s,%s",x,q2string(l->hd));
+  }
+  
+  return aprintf("%s}",x);
+}
+
+static void check_throws_validity(tenv_t te)
+{
+   let fenv =  get_fenv(te,"Tcenv::check_throws_validity");
+	let inf = (*fenv->throws)->hd;
+	let annot = fenv->annot;
+	let notin = NULL;
+	switch(fenv->flags.is_throw_annot)
+	{
+		case 0: fallthru;
+		case 3: break;
+		case 1: if( inf != NULL )
+	     Tcutil::terr(fenv->loc, 
+				"This function was declared with @nothrow attribute but it may throw the following exceptions: %s.",qvl2string(inf));
+		  break;
+		default: 
+		  let it = inf;
+		  let err = false;
+			for(  ; it != NULL ; it = it->tl )
+				if(!exists_throws(annot,it->hd))
+				{
+			     Tcutil::terr(fenv->loc, 
+						"This function was declared with @throws attribute but it throws exceptions other than the ones specified. Example: %s.",
+						 q2string(it->hd));
+					err = true;
+				}
+			if(err)  Tcutil::terr(fenv->loc, "Inferred exceptions of function body: %s",qvl2string(inf));
+		  break;
+	}
+}
+*/

@@ -1,0 +1,187 @@
+#include "cyc_include.h" 
+#define THREADS ((unsigned int) 4)
+#define  BUFFER_SIZE  ((const unsigned int)(30 * 1024 * 1024))
+#define  BUFFER_BYTES_OVERLAP ((const unsigned int) 32)
+
+const char* fragments[] = { "*","**","ggt","ggta","ggtatt", "ggtattttaatt", "ggtattttaatttatagt" };
+
+struct WorkItem<`r::X>;
+typedef struct InputData @`r   idata_t<`r>;
+typedef struct InputData @*`r  idata_opt_t<`r>;
+typedef struct WorkItem<`r> @`r  witem_t<`r>;
+typedef struct WorkItem<`r> *`r  witem_opt_t<`r>;
+typedef struct WorkItem<`r> *@fat @notnull `r witems_t<`r> ;
+typedef unsigned int *@fat *@notnull `r signals_t<`r>;
+typedef unsigned int @{1} `r signal_t<`r>;
+
+struct InputData {
+    unsigned int capacity;
+    unsigned int length;
+    unsigned int logicalIndex;
+    char overlapBytes[BUFFER_BYTES_OVERLAP];
+    char buffer[BUFFER_SIZE+1];
+};
+
+struct WorkItem<`r>  {
+    int first;
+    int last;
+    int length;
+	 int done;
+    idata_opt_t<`r> data;
+//    struct WorkItem<`r> *`r   next;
+};
+
+
+void thread( region_t<`r> h ,
+				 volatile idata_t<`r> data,
+				 region_t<`r1> shared,
+				 volatile signal_t<`r1> thread_count
+			 )
+ @ieffect( {`r,`nat1,`nat1,`H},
+				{`r1,`bar1,`nat0,`H})  @nothrow  @re_entrant{
+	data->capacity = 5;
+	xdec(h);
+
+	xlinc(shared);
+		(*thread_count)--;
+	xldec(shared);
+	xdec(shared);
+}
+
+int main(int argc, char *@fat *@fat argv)
+@throwsany
+{
+    {	region h0 @ heap_region;
+		idata_t data;
+		try{ data = rmalloc(h0,sizeof(struct InputData));
+				data->capacity = BUFFER_SIZE;
+				data->length = 0;
+			 	data->logicalIndex = 0;
+				while(fgets(data->buffer, data->capacity, stdin))
+			    if (strncmp(data->buffer, ">THREE", 6) == 0) break;
+			} catch{ default: xdec(h0); return -1; }
+		xdec(h0);
+	 }
+	
+    unsigned int totalBytesRead = 0;
+	 unsigned int spawned = 0;
+	 region shared @ heap_region;
+	 signal_t<`shared> thread_count;
+	 char overlap[BUFFER_BYTES_OVERLAP] @nozeroterm;
+	 bool overlap_flag = false;
+	 unsigned int prev_log_idx = 0,j,i;
+	 try{
+	 	thread_count = rnew(shared)  0;
+	 } catch { default: xdec(shared); return -1; }
+	 xldec(shared);
+	 while(1){
+			region h @ heap_region;
+			idata_t data;
+			try{
+					data = rmalloc(h,sizeof(struct InputData));
+					data->capacity = BUFFER_SIZE;
+					data->length = 0;
+					if(overlap_flag){
+						data->logicalIndex = prev_log_idx;
+					for(  j = 0 ; j < BUFFER_BYTES_OVERLAP ; j++ )
+								data->overlapBytes[j] = overlap[j];
+					} else data->logicalIndex = 0;
+					while(fgets(&data->buffer[data->length],
+					  (data->capacity + 1) - data->length, stdin)) {
+			   		   data->length += strlen(&data->buffer[data->length]);
+		   		     	if (data->buffer[data->length-1] == '\n') 
+      				      data->buffer[--(data->length)] == 0;
+				 			totalBytesRead += data->length;
+							if( data->length  ==  data->capacity) break;
+					}
+					if( data->length == 0 ) { xdec(h); break; }
+					for( j = 0 ; j < BUFFER_BYTES_OVERLAP ; j++ )
+						overlap[j] = data->buffer[data->length-BUFFER_BYTES_OVERLAP+j];
+					overlap_flag = true;
+					prev_log_idx = data->logicalIndex + data->length;
+
+				/*	for (i=0; i<sizeof(fragments) / sizeof(const char*); i++) {
+            		unsigned int fragmentLength = strlen(fragments[i]);
+		            for (j=0; j<fragmentLength; j++) {
+      		          int firstIndex = (data->logicalIndex == 0) ?  j :
+													 -((data->logicalIndex-j)%fragmentLength);
+		                int lastIndex = data->length - fragmentLength + 1;
+		                //WorkItem* item = new WorkItem(firstIndex, lastIndex, 
+								//									fragmentLength, this, head);
+            		}
+		         }*/
+
+
+
+					if( spawned > THREADS ) //use more threads
+							waitValue(thread_count,THREADS+1,2);
+					xinc(shared);
+					xlinc(shared);
+						spawned = *thread_count;
+						(*thread_count)++;
+					xldec(shared);
+					spawned++;
+					spawn (0U) thread(h,data,shared,thread_count);
+					// do sth useful
+					//xdec(h);
+			}  catch { default: xdec(h); xdec(shared); return -1; }
+	}
+	main_join();	
+	xdec(shared);
+	return 0;
+}
+
+/*
+				{
+	 		  		 		// data ready to go
+						  if( spawned > THREADS ){
+							waitValue(thread_count,THREADS+1,2);
+							xlinc(shared);
+								spawned = *thread_count;
+								(*thread_count)++;
+							xldec(shared);
+						 }
+						 spawned++; 
+						 xinc(shared);
+						 spawn (0U) thread(h,data,shared,thread_count);
+				 }
+			    if (data->length) {
+			        totalBytesRead += data->length;
+					   xinc(shared);
+					  spawn (0U) thread(h,data,shared,thread_count);
+			    } else xdec(h);
+			} catch { default:  xdec(h); return -1; }
+
+*/
+/*
+	try{
+
+
+
+		 let z = atoi(argv[1]);
+		volatile unsigned  int  @{THREADS}  data = rnew(h) 
+																{for i < THREADS : 0};
+		volatile unsigned  int  @{THREADS}  woken = rnew(h) 
+																{for i < THREADS : 0};
+		woken[0] = 1;
+		data[0] = z;
+		unsigned int peer,i;
+   	for (i = 0; i < THREADS ; i++){
+			//peer = (i+1) % THREADS;
+			if( i < THREADS-1 ) peer = i+1;
+			else peer = 0;
+			xinc(h);
+			//spawn (0U) thread(h,a,&b[peer],i,peer);
+		  try{
+			spawn (0U) thread(h,	
+									  data+i,
+									  data+peer,
+									  woken+i,
+									  woken+peer,i);
+			} catch { default: xdec(h); break;}
+		}
+		xldec(h);
+		main_join();
+	} catch { default: xldec(h); break; }
+
+*/

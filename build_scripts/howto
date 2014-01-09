@@ -1,0 +1,30 @@
+HOWTO:
+
+  - Rebuild ORIGINAL compiler and tools
+
+	./reboot.sh
+	mkdir build/boot
+
+  - Rebuild MODIFIED compiler
+
+	./mkall.sh ---> build/boot must exist
+
+ - Make a specified file
+	./mkfile.sh src file  --> ommit file extension
+
+
+TROUBLESHOOTING:
+
+(1)  Cannot stat bin/genfiles/nogc.a
+
+  rm bin/genfiles/nogc.a
+  make clean build_clean all
+
+(2) ./mkfile.sh src ioeffect
+    needs build/boot to be present
+
+(3) ./mkall.sh 
+    needs build/boot to be present
+    Run this if build/boot does not exists/deleted
+
+

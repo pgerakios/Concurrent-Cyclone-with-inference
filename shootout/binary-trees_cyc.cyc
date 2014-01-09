@@ -1,0 +1,183 @@
+/* The Computer Language Benchmarks Game
+ * http://shootout.alioth.debian.org/
+ *
+ * contributed by Francesco Abbate
+ */
+
+//#include "cyc_include.h"
+#include <stdio.h>
+#include <core.h>
+namespace Core {
+  int tid() @nothrow @re_entrant;
+  void main_join() @nothrow; // not re-entrant because it 
+									  // should be used from the main thread
+									  // only.
+  void print_region_pages(region_t<`r::X>) @nothrow @re_entrant;
+}
+
+extern "C include" {
+ void Cyc_print_xstring(const char *s) {
+     if( s!= 0 ) printf("%s",s);
+ }
+} export { Cyc_print_xstring}
+extern void print_xstring(const char *@nozeroterm`r);
+
+extern "C" int  atoi(const char @);
+
+#define xinc(x)  cap (x,1,0,0) 
+#define xdec(x)  cap (x,-1,0,0) 
+#define xlinc(x) cap (x,0,1,0)  
+#define xldec(x) cap (x,0,-1,0) 
+////////////////////////////////////////////////////////////////////
+
+struct Node<`r>
+{
+  int i;
+  struct Node<`r> *`r left;
+  struct Node<`r> *`r right;
+};
+
+typedef struct Node<`r> *`r node_opt<`r>;
+typedef struct Node<`r> @`r node<`r>;
+
+int node_check (const node<`r::X> n)
+//  @ieffect( {`r,`bar1,`nat1} )
+//  @oeffect( {`r,`bar1,`nat1} )
+  @xrgn
+  @re_entrant
+{
+  int result = n->i;
+  const node_opt<`r> l = n->left;
+  const node_opt<`r> r = n->right;
+  if (l) {
+    result += node_check(l);
+    if (r)
+      result -= node_check(r);
+  }
+  return result;
+}
+
+node<`r> make (int i, int depth, region_t<`r::X> pool)
+//  @ieffect( {`r,`bar1,`nat0} )
+//  @oeffect( {`r,`bar1,`nat0} )
+  @xrgn
+  @throws(Bad_alloc)
+  @re_entrant
+{
+  let n  = depth > 0 ?
+            Node{i, make(2*i-1, depth-1, pool), make(2*i, depth-1, pool)}:
+            Node{i, NULL, NULL};
+  let p = rnew(pool) n;
+  return p;
+}
+
+void worker_thread( region_t<`l::X> long_r,
+                    char ?`l::X @`l::X ret,
+                    int d, int max_depth, int min_depth )
+//  @ieffect( {`l,`bar1,`nat0,`H} )
+  @xrgn
+  @nothrow
+  @re_entrant
+{
+  int iterations = 1 << (max_depth - d + min_depth);
+  int c = 0;
+  int i;
+
+  for (i = 1; i <= iterations; ++i) {
+    region store @ long_r;
+    try {
+      node<`store> a = make( i, d, store);
+      node<`store> b = make(-i, d, store);
+      c += node_check(a) + node_check(b);
+    }
+    catch {
+    case &Bad_alloc:
+      fprintf(stderr, "Out of memory!\n");
+      break;
+    }
+    xdec(store);
+  }
+
+  /* each thread write to separate location */
+
+  char *@notnull @fat`l::X ptr =
+    rprintf(long_r, "%d\t trees of depth %d\t check: %d\n",
+            (2 * iterations), d, c);
+
+  xlinc(long_r);
+  *ret = ptr;
+  xdec(long_r);
+}
+
+void main_loop(int req_depth )
+  @throws(Bad_alloc)
+{
+  int min_depth = 4;
+  int max_depth = (req_depth > min_depth + 2 ? req_depth : min_depth + 2);
+  int stretch_depth = max_depth+1;
+
+  /* Alloc then dealloc stretchdepth tree */
+  {
+    region store @ Core::heap_region;
+    try {
+      node<`store> curr = make(0, stretch_depth, store);
+      printf ("stretch tree of depth %i\t check: %i\n", stretch_depth,
+              node_check(curr));
+    }
+    catch {
+    default:
+      break;
+    }
+    xdec(store);
+  }
+
+  region long_lived_pool @ Core::heap_region;
+  xldec(long_lived_pool);
+  try {
+    node<`long_lived_pool> long_lived_tree =
+      make(0, max_depth, long_lived_pool);
+
+    /* buffer to store output of each thread */
+    char *@fat *@notnull @fat outputstr = rnew(long_lived_pool)
+      { for i < max_depth+1 : NULL};
+
+    for (int d = min_depth; d <= max_depth; d += 2) {
+      xinc(long_lived_pool);
+      spawn ($(long_lived_pool,1,0,0)) 
+         worker_thread(long_lived_pool,
+                       outputstr+d, d, max_depth, min_depth);
+    }
+
+    Core::main_join();
+
+    xlinc(long_lived_pool);
+    for (int d = min_depth; d <= max_depth; d += 2) {
+      try {
+        char *@fat `long_lived_pool p = outputstr[d];
+        print_xstring(p);
+      }
+      catch{
+      default:
+        break;
+      }
+    }
+    printf("long lived tree of depth %i\t check: %i\n", max_depth,
+           node_check(long_lived_tree));
+    xldec(long_lived_pool);
+  }
+  catch {
+  default:
+    break;
+  }
+  xdec(long_lived_pool);
+}
+
+int main(int argc, char ?? argv)
+  @throwsany
+{
+  if (argc == 2)
+    main_loop(atoi(argv[1]));
+  else
+    main_loop(10);
+  return 0;
+}

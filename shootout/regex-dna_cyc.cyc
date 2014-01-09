@@ -1,0 +1,417 @@
+#ifndef C_STUB
+#define xinc(x)  cap (x,1,0,0) 
+#define xdec(x)  cap (x,-1,0,0) 
+#define xlinc(x) cap (x,0,1,0)  
+#define xldec(x) cap (x,0,-1,0) 
+
+#define xrlinc(x) cap (x,0,0,1)  
+#define xrldec(x) cap (x,0,0,-1)  
+
+
+#include <stdio.h> 
+#include <stdlib.h> 
+#include <core.h>
+
+namespace Core {
+  int tid() @nothrow @re_entrant;
+  void flush() @nothrow @re_entrant;
+  void main_join() @nothrow; // not re-entrant because it 
+									  // should be used from the main thread
+									  // only.
+  struct MapBuf<`r::X> {
+    <`i::I>               // there exists some unsigned integer i
+    const char *@notnull @nozeroterm @numelts(valueof(`i)) `r p;
+    tag_t<`i> n;       // /* source/destination vector length */
+  };
+
+  struct MapBuf<`r::X> map_file(region_t<`r::X> h, 
+            const char *@zeroterm `r1 p
+ ); 
+
+  extern "C include" {
+
+    void Cyc_print_xstring(const char *s) {
+     if( s!= 0 ) printf("%s",s);
+    }
+
+    `a::A *@fat
+		 Cyc_Core_xmkfat(__nn_cyclone_internal_array_t<`a,`i,`r::X> arr,
+                            sizeof_t<`a> s,
+                            __cyclone_internal_singleton<`i> n) {
+      struct _fat_ptr res;
+      res.curr = arr;
+      res.base = arr;
+      res.last_plus_one = arr + s*n;
+      return res;
+    }
+ } export { Cyc_Core_xmkfat,Cyc_print_xstring
+         }
+
+  extern `a *@fat `r::X xmkfat(__nn_cyclone_internal_array_t<`a,`i,`r::X> arr,
+                      sizeof_t<`a> s, __cyclone_internal_singleton<`i> n)
+							 @nothrow @re_entrant;
+
+ struct MapBuf<`r::X>
+    subst_exp(region_t<`r::X> h,
+	       const char *@notnull @nozeroterm @numelts(valueof(`i)) `r1::X p,
+               tag_t<`i> n,
+	       const char *@notnull @zeroterm `r2::X pat,
+	       const char *@notnull @zeroterm `r3::X str);
+
+ typedef  struct MapBuf<`r1::X> (@`H subst_t<`r1,`i::I>)
+                               (char *@notnull @nozeroterm 
+                                      @numelts(valueof(`i)) `r1::X p,       
+                                tag_t<`i> n);
+
+ struct MapBuf<`r::X>
+      subst_fun(region_t<`r::X> h,
+	       const char *@notnull @nozeroterm @numelts(valueof(`i)) `r1::X p,
+               tag_t<`i> n,
+	       const char *@notnull @zeroterm `r2::X pat,
+	       subst_t fun);
+
+ int count_matches(const char *@notnull @nozeroterm 
+                               @numelts(valueof(`i)) `r1::X p,
+                   tag_t <`i> n,
+   	           const char *@notnull @zeroterm `r2::X pat);
+   
+  extern datatype exn { extern Array_bounds; };
+
+ extern void print_xstring(const char *@zeroterm `r::X);
+}
+
+#define cs(a,b,c) case a: return Core::MapBuf{b,c}; 
+struct Core::MapBuf<`r::X> sub(char *@notnull @nozeroterm 
+                               @numelts(valueof(`i)) `r1::X p,       
+                          tag_t<`i> n) @xrgn {
+   if( n < 1 ) exit(-1); 
+   switch(p[0]) {
+         cs('B',"(c|g|t)",7);
+         cs('D',"(a|g|t)",7);
+         cs('H',"(a|c|t)",7);
+         cs('V',"(a|c|g)",7);
+         cs('N',"(a|c|g|t)",9);
+         cs('K',"(g|t)",5);
+         cs('M',"(a|c)",5);
+         cs('R',"(a|g)",5);
+         cs('S',"(c|g)",5);
+         cs('W',"(a|t)",5);
+         cs('Y',"(c|t)",5);
+      default:
+         exit(-1);
+   }
+}
+
+struct Task<`r1::X,`r2::X> {
+   struct Core::MapBuf<`r1::X> mb;
+	region_t<`r1> r1;
+	region_t<`r2> h;
+	int @{9U} `r2 counts;
+};
+
+typedef struct Task<`r1::X,`r2::X> task_t<`r1::X,`r2::X> ;
+
+ extern "C" void  start_time();
+extern "C" unsigned long end_time();
+
+void compute(task_t<`r::X,`r2::X> t, unsigned i) @xrgn @nothrow @re_entrant {
+ int k0=0,k1=0;
+ let Core::MapBuf{<`i> .p = p1, .n = n1 } = t.mb;
+ // const char @{18U} `r::X pat0 =  "agggtaaa|tttaccct";
+ const char @{26U} `r::X pat[8] = {
+  "[cgt]gggtaaa|tttaccc[acg]",
+  "a[act]ggtaaa|tttacc[agt]t",
+  "ag[act]gtaaa|tttac[agt]ct",
+  "agg[act]taaa|ttta[agt]cct",
+  "aggg[acg]aaa|ttt[cgt]ccct",
+  "agggt[cgt]aa|tt[acg]accct",
+  "agggta[cgt]a|t[acg]taccct",
+  "agggtaa[cgt]|[acg]ttaccct"
+ }; 
+
+    unsigned ii = i+1;
+    if(i>=8 || ii >= 8) exit(-1);
+    switch(i) {
+      case 0:
+            k0  = Core::count_matches(p1,n1,pat[0]),
+            k1  = Core::count_matches(p1,n1,pat[1]);
+            break;
+      case 1:
+            k0   = Core::count_matches(p1,n1,pat[2]),
+            k1   = Core::count_matches(p1,n1,pat[3]);
+            break;
+      case 2:
+            k0   = Core::count_matches(p1,n1,pat[4]),
+            k1   = Core::count_matches(p1,n1,pat[5]);
+            break;
+      case 3:
+            k0   = Core::count_matches(p1,n1,pat[6]),
+            k1   = Core::count_matches(p1,n1,pat[7]);
+            break;
+      default:
+            break;
+  }
+  unsigned a = i*2 ; 
+  unsigned b = a+1, c = a+2;
+  if(a>=9 || b >= 9 || c >= 9 ) exit(-1);
+  xlinc(t.h);
+  t.counts[a]= k0;
+  t.counts[b]= k1;
+  xldec(t.h); 
+  xdec(t.r1);
+  xdec(t.h);
+}
+
+int main(int argc , const char *@fat @zeroterm argv[]) @throwsany{
+  let s = "/proc/self/fd/0"; // argv[1];
+  region r @ Core::heap_region;
+//  let file = "regexdna-input.txt";
+  let mb0 = Core::map_file(r,s); /* read file to memory*/
+  let Core::MapBuf{<`i> .p = p, .n = n } = mb0;
+
+  let mb = // perform substitution 
+      Core::subst_exp(r,p,n,"(>.*\\n)|\\n","");
+
+  region r2 @ Core::heap_region;
+  	int *@numelts(9) @notnull `r2 counts = rnew(r2) { for i < 9  : 0 }; 
+  let task = Task {mb,r,r2,counts};
+
+#define SPAWN(i)   spawn ($(r,1,0,1),$(r2,1,0,0)) compute(task,i);
+#define THREADS 4
+  
+  cap(r,THREADS,-1,THREADS+1); // read-only
+  cap (r2,THREADS,-1,0);
+  SPAWN(0); SPAWN(1); SPAWN(2);  SPAWN(3);
+
+  let Core::MapBuf{<`i> .p = p1, .n = n1 }  = mb;
+
+
+   const char @{18U} `r::X pat0 =  "agggtaaa|tttaccct";
+   let n00  = Core::count_matches(p1,n1,pat0);
+   
+   let Core::MapBuf{<`i> .p = p2, .n = n2 }  =
+     Core::subst_fun(r,p1,n1,"[WYKMSRBDVHN]",sub);
+
+   Core::main_join();
+   xlinc(r2);
+   printf(	   "agggtaaa|tttaccct %d\n"
+		   "[cgt]gggtaaa|tttaccc[acg] %d\n"
+		   "a[act]ggtaaa|tttacc[agt]t %d\n"
+		   "ag[act]gtaaa|tttac[agt]ct %d\n"
+		   "agg[act]taaa|ttta[agt]cct %d\n"
+		   "aggg[acg]aaa|ttt[cgt]ccct %d\n"
+		   "agggt[cgt]aa|tt[acg]accct %d\n"
+		   "agggta[cgt]a|t[acg]taccct %d\n"
+		   "agggtaa[cgt]|[acg]ttaccct %d\n"
+		  	"\n%d\n%d\n%d\n",
+				 n00,
+				 counts[0],
+				 counts[1],
+				 counts[2],
+				 counts[3],
+				 counts[4],
+				 counts[5],
+				 counts[6],
+				 counts[7],
+		  		n,n1,n2); 
+  xdec(r2);
+  xdec(r);
+  return 0;
+}
+
+#else
+#include <glib.h>
+#include <stdlib.h>
+#include <string.h>
+extern void attach_region(void *handle,void *ptr, int len, 
+                     void (*fun)(void*,int));
+
+static void my_gfree(void *p,int len) {
+         g_free(p);
+    }
+
+struct Ret {
+    void *ptr;
+    unsigned len;
+};
+
+struct Ret 
+Cyc_Core_subst_exp(
+        void *handle,
+        const char* s,
+        int n,
+        const char* regex,
+        const char* subst)
+{
+    GError* err = 0;
+    char* rv = NULL;
+    GRegex* prog = NULL;
+
+    /* Compile regex. */
+    prog = g_regex_new(regex,
+                       G_REGEX_CASELESS |
+                       G_REGEX_RAW |
+                       G_REGEX_NO_AUTO_CAPTURE |
+                       G_REGEX_OPTIMIZE,
+                       0,
+                       &err);
+    /* Substitute. */
+   if(!err)
+    rv = g_regex_replace_literal(prog, s,n, 0, subst, 0, &err);
+
+    /* Clean up. */
+    if (prog) {
+        g_regex_unref(prog);
+    }
+
+       char *tmp = rv;
+       int cnt  = 0;
+       while(*tmp++ !='\0') cnt++;
+    attach_region(handle,rv,cnt,my_gfree);
+    struct Ret r =  {rv,cnt};
+    return r;
+}
+
+
+#define copybuf(dst,i,sz,src,len) \
+   do { \
+      int tmp2 = i+len; \
+      if( tmp2 > sz ){ \
+         int tmp1 = tmp2; \
+         int tmp0 = sz*2; \
+         if(tmp0<tmp1) tmp0 = tmp1;\
+         dst = realloc(dst,tmp0); \
+         sz = tmp0;\
+      } \
+      memcpy(dst+i,src,len);\
+      i = tmp2;\
+   } while(0);
+
+
+typedef struct Buf {
+   char *s;
+   int  len;
+} buf_t;
+
+typedef buf_t (subst_t)( char *begin, int len);
+
+struct Ret Cyc_Core_subst_fun
+      (void *handle, 
+      char *orig, int len, char *pat, subst_t f ){
+    GError* err = 0;
+    GMatchInfo *match_info=0;
+    GRegex* prog = g_regex_new(pat,
+                       G_REGEX_CASELESS |
+                       G_REGEX_RAW |
+                       G_REGEX_NO_AUTO_CAPTURE |
+                       G_REGEX_OPTIMIZE,
+                       0,
+                       &err);
+   
+   int ret_len = len;
+   char *end0=orig+len,*prev=orig;
+   char *ret = (char *) malloc(ret_len);
+   int  ret_next = 0;
+   int s=0,e=0;
+
+   if (err) {
+      goto out;
+   }
+
+    g_regex_match_full (prog,orig,len, 0, 0, &match_info, &err);
+    while (g_match_info_matches (match_info)){
+        if(!g_match_info_fetch_pos(match_info,0,&s,&e)){
+           exit(-1);
+        }
+        int tmp0 = e - s;
+        buf_t b = f(orig+s,tmp0);
+        tmp0 = (orig+s) - prev;
+        copybuf(ret,ret_next,ret_len,prev,tmp0);
+        prev = orig+e;
+        if(b.len>0) 
+           copybuf(ret,ret_next,ret_len,b.s,b.len);
+        g_match_info_next(match_info, NULL);
+    }
+   if(prev < end0){
+     int tmp0 = end0 - prev;
+      copybuf(ret,ret_next,ret_len,prev,tmp0);
+   }
+   g_match_info_free(match_info);
+out:   
+   g_regex_unref(prog);
+    attach_region(handle,ret,ret_next,my_gfree);
+    struct Ret r =  {ret,ret_next};
+    return r;
+}
+
+#include <tcl.h>
+/* Return the number of times the regular expression "regexp_cstr"
+ * uniquely matches against the input string "s". */
+static unsigned long
+regcount(
+         const char *p,int len, const char* regexp_cstr)
+{
+   Tcl_Obj* s = 
+    s = Tcl_NewStringObj(p, len);
+    Tcl_IncrRefCount(s);
+
+    int regexec_rv = 0;
+    int index = 0;
+    int index_max = 0;
+    unsigned long rv = 0;
+    Tcl_Obj* regexp_cstr_obj = NULL;
+    Tcl_RegExp regexp = NULL;
+    struct Tcl_RegExpInfo info = {0};
+
+    /* Get "regexp_cstr" as a Tcl string object. */
+    regexp_cstr_obj = Tcl_NewStringObj(regexp_cstr, strlen(regexp_cstr));
+    Tcl_IncrRefCount(regexp_cstr_obj);
+
+    /* Compile the regular expression. */
+    regexp = Tcl_GetRegExpFromObj(NULL, regexp_cstr_obj,
+                 TCL_REG_ADVANCED | TCL_REG_NOCASE | TCL_REG_NEWLINE);
+    if (!regexp) {
+        fprintf(stderr, "*** Error: Tcl_GetRegExpFromObj: failed");
+        exit(1);
+    }
+
+    /* Iterate over each match. */
+    index = 0;
+    index_max = Tcl_GetCharLength(s);
+    while (index < index_max) {
+
+        /* Test for a match. */
+        regexec_rv = Tcl_RegExpExecObj(NULL, regexp, s, index, 1, 0);
+        if (regexec_rv == -1) {
+            fprintf(stderr, "*** Error: Tcl_RegExpExecObj: failed");
+            exit(1);
+        }
+        if (regexec_rv == 0) {
+            /* No matches. */
+            break;
+        }
+
+        /* Get the match information. */
+        Tcl_RegExpGetInfo(regexp, &info);
+
+        /* Advance curr. */
+        index += info.matches[0].end;
+
+        /* Increment the match count. */
+        ++rv;
+    }
+
+    /* Clean up.  Note that "regexp" is owned by "regexp_cstr_obj" so
+     * it does not need explicit clean up. */
+    Tcl_DecrRefCount(regexp_cstr_obj);
+    Tcl_DecrRefCount(s);
+
+    return rv;
+}
+
+volatile int gtid = 1;
+ __thread int mytid = 0;
+int Cyc_Core_count_matches(char *text, int len, char *regex) {
+    return regcount(text,len,regex);
+}
+#endif

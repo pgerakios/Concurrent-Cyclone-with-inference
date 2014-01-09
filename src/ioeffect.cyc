@@ -1,0 +1,4555 @@
+/* I/O Effect Analysis.
+   Copyright (C) 2008 Prodromos Gerakios, NTUA
+   This file is part of the Cyclone compiler.
+
+   The Cyclone compiler is free software; you can redistribute it
+   and/or modify it under the terms of the GNU General Public License
+   as published by the Free Software Foundation; either version 2 of
+   the License, or (at your option) any later version.
+
+   The Cyclone compiler is distributed in the hope that it will be
+   useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with the Cyclone compiler; see the file COPYING. If not,
+   write to the Free Software Foundation, Inc., 59 Temple Place -
+   Suite 330, Boston, MA 02111-1307, USA. */
+
+
+#include <string.h>
+#include <position.h>
+#include <hashtable.h> 
+#include "warn.h"
+#include "tcpat.h"
+#include "absynpp.h"
+#include "tcutil.h"
+#include "insert_checks.h" // use these exn in the analysis
+#include "evexp.h" // evaluate constant expressions
+#include "toc.h" // uses function from toc to predict insertions
+#include "ioeffect.h"
+
+//Debug printing - enable/disable flags
+//#define IOEFFECT_JOIN_DBG
+//#define IOEFFECT_STMT_DBG
+//#define PROPAGATE_S_DBG
+//#define PROPAGATE_E_DBG
+//#define PROPAGATE_LIST_E_DBG
+//#define SUMMARIZE_DBG
+//#define ADD_SUCC_DBG
+//#define  IOEFFECT_E_FNCALL_DBG
+//#define PRINT_SUCC_DBG
+//#define REGION_ACCESSIBLE_DBG
+//#define REGION_LIVE_DBG
+//#define LIVE_FILTERING_DBG
+using Absyn;
+using List;
+namespace IOEffect;
+typedef list_t<Absyn::qvar_t,`H> qvlist_t;
+typedef list_t<qvlist_t,`H> qscope_t;
+typedef List::list_t<$(stmt_t,Tcpat::decision_t) @`H,`H> dlist_t; 
+typedef struct Fenv @`H fenv_t;
+typedef struct Node @`H node_t,*`H node_opt_t;
+typedef list_t<node_t,`H> nlist_t;
+typedef datatype NodeType @`H node_type_t;
+typedef struct Env @`H env_t;
+typedef Hashtable::table_t	<void @,node_t> se_t;
+typedef enum NodeAnnot nannot_t;
+typedef $(qvar_t,list_t<stmt_t,`H>,bool) @`H combined_t; 
+typedef list_t<combined_t,`H> comblist_t;
+typedef struct Enclosed @`H enclosed_t;
+typedef Hashtable::table_t<decl_t,enclosed_t> enclosed_map_t;
+typedef list_t<decl_t,`H> decl_list_t;
+
+// A list of catch bodies and labels enclosed in an 
+// xrgn lexical block
+struct Enclosed 
+{
+  list_t<$(var_t,stmt_t)  @`H,`H> labels;
+//  list_t<$(qvar_t,stmt_t) @`H,`H> catch_bodies;
+};
+
+
+// flags for local function environments
+struct Fenv
+{
+  qscope_t *`H 		throws; // inferred exceptions
+  Absyn::throws_t		annot; //throws annotation
+  se_t 					nodes;
+  dlist_t 				catch_stack; 
+  fndecl_t			   fd;
+  list_t<decl_t,`H>  enclosing_xrgn;
+  enclosed_map_t		enclosed_map;
+  stmt_t					exit_stmt; //Invariant: input and output effect = fun output effect
+  list_t<var_t,`H>   labels;
+  bool					ignore_xrgn;
+};
+
+datatype NodeType
+{
+  Exp(exp_t);
+  Stmt(stmt_t);
+};
+
+enum NodeAnnot
+{
+   MayJump = 0, // all exp/stmt are MayJump
+	//   MustLoopJump = 1,  // there exists at least one break/continue
+   MustJump =  1
+};
+
+struct Node 
+{
+  node_type_t n;
+//  bool  visited;
+  nannot_t annot;
+  seg_t	 loc;
+  effect_t input;
+  effect_t output; // NULL for definite jumps (bottom effect)
+//  effect_t jump_effect;
+  qvlist_t throws; 
+  nlist_t  succ; // successors -- via jump
+//  decl_list_t enclosing; //useful for
+//  bool throwsany;
+//   list_t<var_t,`H> contains_labels;
+};
+
+struct Env
+{
+  JumpAnalysis::jump_anal_res_t tables;
+  fenv_t fenv;
+  list_t<Absyn::absyn_annot_t,`H> annot;
+  bool const_effect;
+  nlist_t jlist;
+//  list_t<node_t,`H> jannot_stack;
+};
+
+/////////////////////////////////////////////
+datatype exn {IOEffect_error};
+datacon(exn,IOEffect_error);
+/////////////////////////////////////////////
+
+ //construsct the "empty" effect
+ datatype Type.TupleType dummy_type = TupleType(NULL);
+ struct RgnEffect dummy_rgneffect = RgnEffect(&dummy_type,NULL,NULL);
+ struct List<rgneffect_t,`H>  empty_effect = 
+												List(&dummy_rgneffect,NULL);
+
+//////////////////////////////////////////////////////////////////////
+static $(list_t<`a,`r> ,list_t<`a,`r>) split_list( bool (@pred)(`c,`a),
+														  `c env,
+															list_t<`a,`r> l,
+															region_t<`r> h  )
+{
+  list_t<`a,`r>  fst = NULL,snd = NULL, *z = NULL;
+  for( ; l != NULL ; l = l->tl )
+  { z = pred(env,l->hd)?&fst:&snd;   *z = rnew(h) List(l->hd,*z);  }
+  return $(List::rrev(h,fst),List::rrev(h,snd));
+}
+static list_t<`d @`r,`r> cond_map_list( `d *`r (@pred)(`c,`a),
+											   `c   env,
+											   list_t<`a,`r> l,
+											   region_t<`r> h )
+{
+   if( l == NULL ) return NULL;
+	list_t<`d @`r,`r> hd,tl;
+   `d *`r p = NULL;
+   for( ; l != NULL && p == NULL ; p=pred(env,l->hd), l = l->tl );
+	if( p == NULL ) return NULL;
+	hd = tl = new List(p,NULL);
+   for( ; l != NULL ; l = l->tl )
+	{
+		p = pred(env,l->hd);
+		if( p != NULL ) tl = (tl->tl=new List(p,NULL));
+   }
+	return hd;
+}
+/////////////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////
+static bool is_heaprgn( type_opt_t r ) {	return r == heap_rgn_type; }
+
+static bool rgn_cmp( type_t r1, type_t  r2 )
+{
+	 if( is_heaprgn(r1) ) return is_heaprgn(r2);
+	 if( is_heaprgn(r2) ) return is_heaprgn(r1);
+	 switch($(r1,r2))
+	 {
+		case $(&VarType(vt1),&VarType(vt2)): return (tvar_cmp(vt1,vt2) == 0);
+		default:
+				Warn::impos("IOEffect::rgn_cmp %s and %s",
+							Absynpp::typ2string(r1),Absynpp::typ2string(r2));
+	 }
+}
+
+static rgneffect_opt_t find_effect(type_t r1 , effect_t l )
+{
+	 switch(Tcutil::compress(r1))
+	 {
+		case &VarType(vt1): return Absyn::find_rgneffect(vt1,l);
+		default: Warn::impos("IOEffect::find_effect");
+	 }
+}
+
+
+static rgneffect_t  copyeffelt( rgneffect_t  f )
+{  return Absyn::copy_rgneffect(f); }
+
+static effect_t new_rgn_effect( type_t r, type_opt_t rpar, effect_t f )
+{
+ 	   let cp = new List(Absyn::new_nat_cap(1,false),
+					  new List(Absyn::new_nat_cap(1,false),NULL));
+		return new List(new_rgneffect(r,cp,rpar),f);
+}
+
+`a env_err(string_t msg) __attribute__((noreturn)) 
+{
+  printf("\n%s\n",msg);fflush(stdout);
+  throw &IOEffect_error_val;
+}
+
+`a @`r safe_cast( `a *`r ptr , string_t msg )
+{
+  if( ptr == NULL )
+	Warn::impos("IOEffect::safe_cast: \"%s\"",msg);
+  else return (`a @`r) ptr;
+}
+
+// absyn_annot_t is an extensible data type and
+// should be one of the following:
+//  &InsertChecks::NoCheck, &InsertChecks::NullOnly,
+//  &InsertChecks::NullAndFatBound,
+//  &InsertChecks::FatBound,
+//  &InsertChecks::NullAndThinBound(e),
+//  &InsertChecks::ThinBound(e)
+string_t annot2string( @extensible datatype Absyn::AbsynAnnot @x)
+{
+  switch(x)
+  {
+ 	case &InsertChecks::NoCheck: return "no check";
+   case &InsertChecks::NullOnly: return "null check";
+   case &InsertChecks::NullAndFatBound: return "null and bound";
+   case &InsertChecks::FatBound: return "bound check";
+   case &InsertChecks::NullAndThinBound(e):
+		return aprintf("null and thin bound of %s",Absynpp::exp2string(e));
+   case &InsertChecks::ThinBound(e):
+		return aprintf("thin bound of %s",Absynpp::exp2string(e));
+	default:
+		 return "unknown annotation";
+  }
+}
+
+
+ $(Absyn::tvar_opt_t,Absyn::exp_t)
+decl2xrgn( decl_t d )
+{
+   	 switch(d->r)
+		 {
+   	  case &Region_d(tv,_,eo) &&
+				 eo != NULL && 
+				 ((int) eo->loc) < 0: return $(tv,eo);
+		  default:  env_err("decl2xrgn");
+		 }
+}
+	
+$(Absyn::tvar_opt_t,Absyn::exp_t,Absyn::stmt_t)
+stmt2xrgn( Absyn::stmt_t s ) 
+{ 
+  switch(s->r)
+  {
+	  case &Decl_s(d,s1):
+   	 switch(d->r)
+		 {
+   	  case &Region_d(tv,_,eo) &&
+				 eo != NULL && 
+				 ((int) eo->loc) < 0: return $(tv,eo,s1);
+		  default:  env_err("stmt2xrgn");
+		 }
+	  default: env_err("stmt2xrn");
+  }			
+}
+
+
+static int hash_ptr(`a s){   return (int)s; }
+static Hashtable::table_t<`a@,`b> make_ptr_table() 
+{  return Hashtable::create(33, Core::ptrcmp, hash_ptr); }
+
+static fn_info_t fn_type( type_t t )
+{
+ switch(t)
+ {
+  case &FnType(i): return i;
+  case &PointerType(PtrInfo{&FnType(i),...}): return i;
+  //case &PointerType(PtrInfo{&TypedefType(_,_,_,&FnType(i)),...}): return i;
+  case &TypedefType(_,_,_,&PointerType(PtrInfo{&FnType(i),...})): return i;
+  case &Evar(_,&PointerType(PtrInfo{&FnType(i),...}),...): return i;
+
+  default:	 env_err(aprintf("IOEffect::fn_type %s => %s",
+									Absynpp::typ2string(t),typcon2string(t)));
+
+ }	
+}
+
+/* Extract @throws annotation
+   If empty then assume @nothrow
+   The list always contains at least one element
+ */
+static throws_t fn_throw_annot( type_t t )
+{
+  let z = fn_type(t).throws;   
+  return (z!=NULL)?z:Absyn::throwsany();
+}
+
+
+bool cmp_effect( effect_t f1 ,effect_t f2 )
+{
+	return (f1 == f2) || Absyn::equal_rgneffects(f1,f2);
+}
+
+bool cmp( `a a , `a b ) {   return (a==b); }
+////////////////////////////////////////////////
+/////////Environment API //////////////////
+///////////////////////////////////////////
+static fenv_t new_fenv(fndecl_t fd,	Position::seg_t loc,stmt_t s )
+{
+  let ftyp = (type_t) fd->cached_type;
+  return new
+    Fenv{	
+				.throws		 = new NULL,
+			   .annot = fn_throw_annot(ftyp),
+				.nodes = make_ptr_table(),
+				.catch_stack = NULL,
+				.fd  = fd,
+				.enclosing_xrgn = NULL,
+				.enclosed_map = make_ptr_table(),
+				.exit_stmt = s,
+				.labels = NULL,
+				.ignore_xrgn = false
+	 	  };
+}
+
+static inline void set_ignore_xrgn( fenv_t f , bool b ){
+	f->ignore_xrgn = b;
+}
+
+static inline bool should_ignore_xrgn(fenv_t f ){
+ return  f->ignore_xrgn ;
+}
+/*static bool is_defined_xrgn(fenv_t f, type_t name ){
+	let tv = type2tvar(name);
+	let ieff = f->fd->i.ieffect;
+	if( find_rgneffect(tv,ieff) != NULL ) true;
+   for( _ iter = f->enclosing_xrgn ; iter != NULL ; iter=iter->tl ){
+		switch(iter->hd){
+		    case	  &Decl{.r=&Region_d(tv1,_,_),...} :
+					if( rgneffect_tvar_cmp(tv,tv1) ) return true;
+					break;
+			 default: env_err("ioeffect::is_defined_xrgn");
+		}
+	}
+   return false;
+}*/
+
+static stmt_t exit_stmt( fenv_t f ){ return f->exit_stmt; }
+
+static enclosed_t get_enclosed(fenv_t env, decl_t d )
+{
+  let x = Hashtable::lookup_opt(env->enclosed_map,d);
+  if( x == NULL )
+  {
+	 let n = new Enclosed(NULL); //,NULL);
+	 Hashtable::insert(env->enclosed_map,d,n);
+    return n;
+  }
+  else return *x;
+}
+
+static void push_label( fenv_t fenv, var_t v )
+{
+	fenv->labels = new List(v,fenv->labels);
+}
+
+static void pop_label( fenv_t fenv )
+{
+  if( fenv->labels == NULL ) env_err("pop_label");
+  fenv->labels = fenv->labels->tl;
+}
+
+// add label v to all enclosing xrgn 
+static void add_enclosed_label( fenv_t env , var_t v , stmt_t s )
+{
+  let iter = env->enclosing_xrgn;
+  for( ; iter != NULL ; iter = iter->tl)
+  {
+	  enclosed_t enc = get_enclosed(env,iter->hd);
+	  enc->labels = new List(new $(v,s),enc->labels);
+  }
+}
+/*
+//add qualified variable of catch case to all enclosing xrgn
+static void add_enclosed_catch( fenv_t env, qvar_t q , stmt_t s )
+{
+  let iter = env->enclosing_xrgn;
+  for( ; iter != NULL ; iter = iter->tl)
+  {
+	  enclosed_t enc = get_enclosed(env,iter->hd);
+	  enc->catch_bodies = new List(new $(q,s),enc->catch_bodies);
+  }
+}
+*/
+static void push_enclosing_xrgn(env_t env, decl_t s )
+{
+  let tl =  env->fenv->enclosing_xrgn;
+  env->fenv->enclosing_xrgn = new List(s,tl);
+}
+
+static void pop_enclosing_xrgn(env_t env )
+{
+  let tl =  env->fenv->enclosing_xrgn;
+  if( tl == NULL ) env_err("pop_enclosing_xrgn");
+  env->fenv->enclosing_xrgn = tl->tl;
+}
+
+static void push_catch_block( env_t env,stmt_t s, Tcpat::decision_t  d	 )
+{
+ let fenv = env->fenv;
+ fenv->catch_stack = new List(new $(s,d),fenv->catch_stack);
+}
+
+static void cond_pop_catch_block( env_t env , stmt_t s)
+{
+  let fenv = env->fenv; 
+  if( fenv->catch_stack == NULL )  return;
+  let l =  fenv->catch_stack;
+  if( (*l->hd)[0] == s ) fenv->catch_stack = l->tl;
+}
+////////////////////////////////////////////////////////////
+static node_t get_stmt(fenv_t env, stmt_t s );
+/*
+static void push_node( env_t env,node_t s )
+{	
+  env->jannot_stack = new List(s,env->jannot_stack); 
+}
+
+static node_t pop_node( env_t env  )
+{
+  let l = env->jannot_stack;
+  if( l == NULL ) env_err("pop_node");
+  let n = l->hd;
+  env->jannot_stack = l->tl;
+  l = env->jannot_stack;
+  return n;
+}
+static node_opt_t peek_node( env_t env  )
+{
+  let l = env->jannot_stack;
+  if( l == NULL ) return NULL;
+  return l->hd;
+}
+*/
+///////////////////////////////////////
+
+
+////////////////////////////////////////////////
+///////// NODE API ///////////////////////////////
+//////////////////////////////////////////////////////////////
+#define get_node_jump(x) (((node_t)x)->annot)
+#define set_node_jump(x,y) ((((node_t)x)->annot) = y)
+#define get_node_succ(x) (((node_t)x)->succ)
+
+//#define node_labels(n) (((node_t)n)->contains_labels)
+//#define node_jumps(n) (((node_t)n)->contains_jumps)
+static string_t node2string( node_t n ){
+  switch(n){
+	 case &Node(&Stmt(s),...): return Absynpp::stmt2string(s);
+	 case &Node(&Exp(e),...): return Absynpp::exp2string(e);
+  }
+}
+static node_t stmt_node( stmt_t s )
+{
+  return new Node( new Stmt(s),MayJump,0,NULL,NULL,NULL,NULL);
+}
+
+static node_t exp_node( exp_t e )
+{
+  return new Node( new Exp(e),MayJump, 0,NULL,NULL,NULL,NULL);
+}
+
+static node_t get_exp(fenv_t env, exp_t e )
+{
+  let x = Hashtable::lookup_opt(env->nodes,(void @)e);
+  if( x == NULL )
+  {
+	 let n = exp_node(e);
+	 Hashtable::insert(env->nodes,(void @)e,n);
+    return n;
+  }
+  else return *x;
+}
+
+static node_t get_stmt(fenv_t env, stmt_t s )
+{
+  let x = Hashtable::lookup_opt(env->nodes,(void @)s);
+  if( x == NULL )
+  {
+	 let n = stmt_node(s);
+	 Hashtable::insert(env->nodes,(void @)s,n);
+    return n;
+  }
+  else return *x;
+}
+
+void add_succ( node_t n1 , node_t n2, string_t msg )
+{
+  if(!List::exists_c(cmp,n2,n1->succ))
+  {
+		#ifdef ADD_SUCC_DBG
+		{
+			  printf("\n@@@@@@@@@@@@@@@@@@@@@add_succ (%s)  ", msg);
+			  switch(n1->n)
+			  {
+				 case &Exp(e): 
+						printf("e=%s => succ = ", Absynpp::exp2string(e)); break;
+				 case &Stmt(s):  printf("s=%s => succ = ", Absynpp::stmt2string(s)); break;
+  				}
+				switch(n2->n)
+			   {
+				 case &Exp(e): 
+					printf("e=%s\n", Absynpp::exp2string(e)); break;
+				 case &Stmt(s):  
+					printf("e=%s\n", Absynpp::stmt2string(s)); break;
+			   }
+			   fflush(stdout);
+		}
+		#endif
+	   n1->succ = new List(n2,n1->succ);
+  }
+}
+void add_stmt_succ( fenv_t env , stmt_t s , stmt_t s1)
+{
+  let n1 = get_stmt(env,s);
+  let n2 = get_stmt(env,s1); //add it if it hasn't been added
+  add_succ(n1,n2,"add_stmt_succ");
+}
+
+void add_exp_succ( fenv_t env, exp_t s , stmt_t s1 )
+{
+  let n1 = get_exp(env,s);
+  let n2 = get_stmt(env,s1); //add it if it hasn't been added
+  add_succ(n1,n2,"add_exp_succ");
+}
+static effect_t get_input(node_t n) 
+{
+	let i = n->input;
+	if( i == &empty_effect ) return NULL;
+	else return i;
+}
+static effect_t get_output(node_t n) {
+	let i = n->output;
+	if( i == &empty_effect ) return NULL;
+	else return i;
+}
+
+static Position::seg_t node_seg( node_t n )
+{
+  switch(n->n)
+  {
+	 case &Exp(e): return e->loc;
+	 case &Stmt(s): return s->loc;
+  }
+}
+static void set_throws( node_t n, list_t<qvar_t,`r>  ql )
+{    n->throws = List::copy(ql); }
+
+static void set_input_effect( node_t n, effect_t f , Position::seg_t loc )
+{
+  // if(  f == NULL ) return; //bottom effect can be joined with any effect
+  //Warn::impos("set_input_effect");  
+  /*
+  printf("\nSetting input effect for ");
+  switch(n->n)
+  {
+	 case &Exp(e): printf("expression : %s to ", Absynpp::exp2string(e)); break;
+	 case &Stmt(s):  printf("statement : %s to ", Absynpp::stmt2string(s)); break;
+  }
+  printf("%s | DONE\n",effect2string(f)); fflush(stdout);
+  */
+  if( f == NULL ) f = &empty_effect;
+  let curr = n->input;
+  if( curr == NULL ) // not any entries yet
+  {
+	 n->input = f;
+	 n->loc = loc;
+  }
+  else
+  {
+	  if( curr != f &&
+		  (f == &empty_effect || curr == &empty_effect ||
+		  !cmp_effect(curr,f)))
+	 {
+	   let nseg = node_seg(n); // node seg
+		let is = Position::string_of_segment(n->loc); // input seg
+		let cs = Position::string_of_segment(loc); // current seg
+		string_t f1 =  (curr == &empty_effect?"(empty)":effect2string(curr)),
+					f2 =  (f == &empty_effect?"(empty)":effect2string(f));
+	 	Tcutil::terr(nseg,"The input effect of this node %s (set at %s) does not match the effect that flows into this node %s (jump from %s)",
+						  f1,is,f2,cs);
+	 }
+  }
+}
+
+// progagate input effect to jump targets
+static void propagate_succ( node_t n , effect_t f )
+{
+	if( n->succ != NULL && f != NULL )
+	{
+	 /*
+	  printf("\nSetting succ input effect for ");
+	  switch(n->n)
+	  {
+		 case &Exp(e): printf("expression : %s \n ", Absynpp::exp2string(e)); break;
+		 case &Stmt(s):  printf("statement : %s \n ", Absynpp::stmt2string(s)); break;
+		  }*/
+		//if( n->jump_effect != NULL ) env_err("set_output_effect"); 
+		//n->jump_effect = f;
+   	let iter = n->succ;
+	   let loc = node_seg(n);
+		for( ; iter != NULL ; iter = iter->tl ) set_input_effect(iter->hd,f,loc);
+		//  	printf("\nSETTING SUCC DONE\n"); fflush(stdout);
+	}
+   //Warn::impos("set_output_effect");  
+}
+
+
+//set this node's effect and propagate it as the input effect
+// of its successors
+static void set_output_effect( node_t n,effect_t f  )
+{//set once
+	//if(f == NULL ) return; //bottom effect can be joined with any effect
+	if( f == NULL ) f = &empty_effect;
+	let curr = n->output;
+   if( curr == NULL ) // not any entries yet
+	{
+	   n->output = f;
+	}
+	else
+	{
+	  if( curr != f &&
+		  (f == &empty_effect || curr == &empty_effect ||!cmp_effect(curr,f)))
+		 // strict equality
+	  {
+	   let nseg = node_seg(n); // node seg
+		let is = Position::string_of_segment(n->loc); // input seg
+		let cs = Position::string_of_segment(n->loc); // FIXME: bad loc
+		string_t f1 =  (curr == &empty_effect?"(empty)":effect2string(curr)),
+					f2 =  (f == &empty_effect?"(empty)":effect2string(f));
+	 	Tcutil::terr(nseg,"The output effect of this node %s (set at %s) does not match the effect that flows into this node %s (jump from %s)",
+						  f1,is,f2,cs);
+	  } 
+	}
+   propagate_succ(n,f);
+}
+
+// Fill-in successors of current node
+static void add_throws_effect( fenv_t env, exp_t e, comblist_t cl )
+{
+  qvlist_t throws; 
+  nlist_t  succ; // successors -- via jump
+  node_t n =  get_exp(env,e);
+  //dummy exit statement for func
+  let ex = exit_stmt(env); 
+  for( ; cl != NULL ; cl = cl->tl )
+  {
+	 let c = *cl->hd;
+	 n->throws = add_qvar(n->throws,c[0]);
+	 //add dummy exit stmt if uncaught
+	 // printf("\nUncaught ? %d \n", c[2] ); fflush(stdout);
+	 let iter =  (c[2])?new List(ex,c[1]):c[1];
+	 for( ; iter != NULL ; iter = iter->tl )
+	 {
+     //add it if it hasn't been added
+	  let n2 = get_stmt(env,iter->hd); 
+	  add_succ(n,n2,"add_throws_effect");
+    }
+  }
+}
+///////////////////////////////////////////////////////////////////
+
+/*
+static void add_enclosing( fenv_t f, node_t n )
+{
+  if( n->enclosing == NULL)  n->enclosing = List::copy(f->enclosing_xrgn);
+}
+*/
+
+
+// Register the successor node of this node to the current environment
+// We only care about jump statements (Break,Continue,Goto,Fallthru,Return)
+static void register_stmt_succ( env_t env , stmt_t s )
+{
+  switch(s->r)
+  {
+  	 case &Break_s:  fallthru;
+	 case &Continue_s: fallthru;
+	 case &Goto_s(_): fallthru;
+    case &Fallthru_s(_,_): break;
+	 // if it is a Return statement then the dummy exit block is the successor node
+	 case &Return_s(_): 
+	   add_stmt_succ(env->fenv,s ,env->fenv->exit_stmt); 
+	   //add_enclosing(env->fenv,get_stmt(env->fenv,s));
+		return;
+	 default: return; //ignore others
+  }
+  let tab = env->tables->succ_tables;
+  let opt = 	Hashtable::lookup_opt(tab,env->fenv->fd);
+  if( opt == NULL ) env_err("IOEffect::register_stmt_succ");
+  else switch(Hashtable::lookup_opt(*opt,s))
+  {
+	case &opt1 && opt1 != NULL: 
+	  add_stmt_succ(env->fenv,s ,opt1); 
+	  //add_enclosing(env->fenv,get_stmt(env->fenv,s));
+	  break;
+	default: 
+	  add_stmt_succ(env->fenv,s ,env->fenv->exit_stmt); 
+	  //add_enclosing(env->fenv,get_stmt(env->fenv,s));
+	  break;
+  }
+}
+///////////////////////////////////////////////////////////////////
+typedef $(qvar_t,stmt_t) @`H  catch_t;
+typedef  qvar_t				   nocatch_t;
+typedef list_t<nocatch_t,`H>  nocatches_t;
+typedef list_t<catch_t,`H>    catches_t;
+
+static $(catches_t,nocatches_t)
+ analyze_tree( qvar_t n, datatype Tcpat::Decision@ d,  int depth) 
+{
+  let in = NULL;
+  let out = NULL;
+  switch (d) 
+  {
+	case &Tcpat::Failure(_): env_err("analyze_tree");
+  	case &Tcpat::Success(rhs):
+		 if( depth > 0 )
+		 {
+			 if( is_exn_stmt(rhs-> rhs) )
+				 out = new List(n,out);
+			 else
+			 	 in  = new List(new $(n,rhs->rhs),in);
+		 }
+		 else if( depth == 0 ) //special case
+		 {
+			 if( is_exn_stmt(rhs-> rhs) ) return $(NULL,NULL);//empty catch block
+			 //just default case in catch block
+			 else in = new List( new $(default_case_qvar(),rhs->rhs),NULL);
+		 }
+	 	 else env_err("analyze_tree impos");
+	    break;
+   case &Tcpat::SwitchDec(_,cases,def): // cases , default case
+	 if( depth == 0 )
+	 {
+	    for (; cases != NULL; cases = cases->tl) 
+		 {
+	      let $(pt,d) = *cases->hd;
+			switch(pt)
+		   {
+		     case &Tcpat::EqExtensibleDatatype(_,f):
+				let $(in1,out1) = analyze_tree(f->name,d,1);
+				in = List::append(in,in1);
+				out =  List::append(out,out1);
+				break;
+			  default: env_err("analyze_tree");
+		   }
+       } 
+	 }
+	 else	 if( depth > 0 )
+	 {
+		 for (; cases != NULL; cases = cases->tl) 
+		 {
+	      let $(pt,d) = *cases->hd;
+			let $(in1,out1) = analyze_tree(n,d,1);
+			in = List::append(in,in1);
+			out = List::append(out,out1);
+		 }
+	 }
+	 else env_err("analyze_tree impos");
+	 let $(in1,out1) = analyze_tree(n,def,depth);
+	 in = List::append(in,in1);
+	 out = List::append(out,out1);
+	 break;
+  }
+  return $(in,out);
+}
+
+static string_t catch2string( catch_t c )
+{
+  return aprintf("BEGIN_CATCH(%s,%s)END_CATCH", *((*((*c)[0]))[1]), 
+										Absynpp::stmt2string((*c)[1]));
+}
+
+static string_t nocatch2string( nocatch_t c )
+{
+  return aprintf("BEGIN_NOCATCH(%s)END_NOCATCH", *((*c)[1]));
+}
+
+static string_t cnc2string( $(catches_t,nocatches_t) z )
+{
+  return aprintf("BEGIN CATCH LIST\n %s\nEND CATCH LIST\nBEGIN NO CATCH LIST\n%s\nEND NO CATCH LIST",
+						list2string(z[0],catch2string),list2string(z[1],nocatch2string));
+}
+
+static string_t combined2string( combined_t c )
+{
+  let d = *c;
+  return aprintf("\nExn name: %s, Uncaught: %d , May Handlers: %s",
+						Absynpp::qvar2string(d[0]),d[2],list2string(d[1],Absynpp::stmt2string));
+}
+
+static string_t comblist2string( comblist_t c )
+{   return list2string(c,combined2string); }
+
+static bool my_qvar_cmp( qvar_t q1 , qvar_t q2 )
+{	//PG: FIXME: this is extremely ad-hoc and should be changed
+   return strcmp(Absynpp::qvar2string(q1), Absynpp::qvar2string(q2)) == 0;
+}
+static bool not_my_qvar_cmp( qvar_t q1 , qvar_t q2 ){return !my_qvar_cmp(q1,q2); }
+static bool my_qvar_cmp2( qvar_t q1, catch_t q2){   return my_qvar_cmp(q1,(*q2)[0]); }
+static list_t<`a,`H> remove_duplicates( bool (@eq)(`a,`a), list_t<`a,`H> l )
+{
+  if( l == NULL ) return NULL;
+  let $(a,b) = split_list(eq,l->hd,l,Core::heap_region); 
+  return new List(a->hd, remove_duplicates(eq,b));
+}
+static stmt_t catch2stmt( catch_t c ){ return (*c)[1]; }
+static comblist_t sum_catch( catches_t cl )
+{
+ if( cl == NULL ) return NULL;
+ let c = cl->hd;
+ let q = (*c)[0];
+ let $(a,b) = split_list(my_qvar_cmp2,q,cl,Core::heap_region); 
+ let stmts = remove_duplicates(cmp,List::map(catch2stmt,a));//duplicate handlers
+ return new List( new $(q,stmts,false), sum_catch(b));
+}
+static void set_nocatch_flag( nocatches_t nc, combined_t c )
+{ if(List::exists_c(my_qvar_cmp,(*c)[0],nc)) (*c)[2] = true; }
+static bool qvar_combined_cmp( qvar_t q1, combined_t q2){  return my_qvar_cmp(q1,(*q2)[0]); }
+static $(comblist_t,stmt_opt_t) combine( catches_t c,nocatches_t nc )
+{
+  let $(def,ret) = split_list(qvar_combined_cmp,default_case_qvar(),
+										sum_catch(c),Core::heap_region); 
+  stmt_opt_t defstmt = (def==NULL)?NULL:((*def->hd)[1])->hd; //default handler
+
+  if( defstmt == NULL ) // uncaught exceptions (in catch pattern but inexhaustive)
+	  //should be marked as trully uncaught if there is no handler
+	  List::iter_c(set_nocatch_flag,nc,ret); // include no catch info
+  return $(ret,defstmt);
+}
+///////////////////////////////////////////////////////////////////////
+static void comb_comb( $(comblist_t @,bool) @`r par, combined_t newl  )
+{
+	let $(curr,any) = *par;
+   let iter = *curr;
+	let q = (*newl)[0];
+	for( ; iter != NULL ; iter = iter->tl )
+		if(  my_qvar_cmp((*iter->hd)[0],q))
+		{
+		  if((*iter->hd)[2] ) //uncaught
+		  {
+			(*iter->hd)[1] = remove_duplicates(cmp,//add handlers
+						List::append((*iter->hd)[1],(*newl)[1]));
+			(*iter->hd)[2] = (*newl)[2]; //update status
+		  }
+		  return;
+		}
+  if(any)	*curr = new List(newl,*curr); 
+}
+static void defstmt_comb( stmt_t def , combined_t comb )
+{
+	if( (*comb)[2] )
+	{
+	   (*comb)[2] = false;
+	   (*comb)[1] = remove_duplicates(cmp,new List(def,(*comb)[1]));
+	}
+}
+
+static combined_t q2comb( qvar_t q )
+{ return new $(q,NULL,true); } //a new unacaught exception,with no "may catch" handlers
+static bool is_uncaught( combined_t c ) {   return (*c)[2];  }
+////////////////////////////////////////////////////////////////////////
+static void check_exn_annot(Position::seg_t loc, throws_t annot, comblist_t comb )
+{
+	if( annot == NULL ) return;
+	for( ; comb != NULL ; comb = comb->tl )
+	{
+		let c = *comb->hd;
+		if( c[2] && !exists_throws(annot,c[0]) )
+		{
+			let s1 = throws_qvar2string(c[0]);
+			let s2 = throws2string(annot);
+			Tcutil::terr(loc,"Expression throws uncaught exception %s. %s is not declared in throws annotation  %s so it needs to be caught.",
+								s1,s1,s2);
+		}
+	}
+}
+
+static comblist_t derive_comblist( dlist_t iter, list_t<qvar_t,`r> ql,bool any)
+{
+	bool set_def = false;
+	let comb = List::map(q2comb,ql);//start off as uncaught exn list
+   for( ; iter ; iter = iter->tl )//walk over catch stack
+	{
+		let $(c,nc) = analyze_tree(default_case_qvar(),(*iter->hd)[1],0);
+		let $(newcomb,defstmt) = combine(c,nc);
+		let comb_par = $(&comb,any);
+		List::iter_c(comb_comb,&comb_par,newcomb);//update throws list with the new handlers
+		if( defstmt != NULL ) //found default handler. Done
+		{
+			List::iter_c(defstmt_comb,defstmt,comb);
+			if( any && !set_def)
+			{
+				set_def = true;
+				comb = new List( new $(any_qvar(),new List(defstmt,NULL),false),comb);
+			}
+			break;		
+		}
+	  	if(!any && !List::exists(is_uncaught,comb)) break;//all exceptions caught
+	}
+	if(any && !set_def) comb = new List(new $(any_qvar(),NULL,true),comb);
+   return comb;
+}
+
+//static bool not_any_qvar(combined_t q )  { return !is_any_qvar((*q)[0]); }
+// All exception-throwing expressions call this function 
+static void register_exp_succs_generic( fenv_t env, exp_t e,
+													 list_t<qvar_t,`r> ql , bool any ) 
+{
+	if( ql == NULL && any == false ) env_err("register_exp_succs");
+   //create a map exn -> handlers, given the "catch stack"
+   // and the exceptions (ql) thrown
+	let comb = derive_comblist(env->catch_stack,ql,any);  
+	//printf("\nREGISTER_EXP_SUCCS BEGIN\n\n%s\n\nREGISTER_EXP_SUCCS\n\n",
+	//			comblist2string(comb)); fflush(stdout);
+  //check if uncaught exn match throws annotation	
+	if( is_throwsany(env->annot) == false )
+		check_exn_annot(e->loc,env->annot,comb);
+	//if( any ) comb = List::filter(not_any_qvar,comb);
+	add_throws_effect(env,e,comb); //update successor nodes of e 
+}
+
+static void register_exp_succs( fenv_t env, exp_t e, list_t<qvar_t,`r> ql ) 
+{ register_exp_succs_generic(env,e,ql,false);}
+
+static void register_exp_throwsany( fenv_t env, exp_t e )
+{ //printf("\nTHROWSANY : %s\n",Absynpp::exp2string(e));fflush(stdout);
+  register_exp_succs_generic(env,e,NULL,true); }
+
+static void register_exp_succ( fenv_t env, exp_t e , qvar_t q )
+{  let l = List(q,NULL);   register_exp_succs(env,e,&l); }
+
+///////////////////////////////////////////////////
+//// Exception analysis /////////////////////////
+
+// this is called by all functions that wish to register an exception
+// registers q as one of the successor nodes of e 
+static void add_env_exn( fenv_t te , exp_t e , Absyn::qvar_t q )
+{
+  let x = *safe_cast(te->throws,"add_env_exn");
+  register_exp_succ(te,e,q) ;
+  x->hd = add_qvar(x->hd,q);
+}
+
+static qvar_t conv( datatypefield_t d){   return d->name; }
+
+static void add_throws( env_t te,  exp_t e )
+{
+  type_t t = safe_cast(e->topt,"add_throws");
+  Position::seg_t loc = e->loc;
+  let iter = fn_throw_annot(t);
+  let fenv = NULL;
+  fenv = te->fenv;
+  if( Absyn::is_nothrow(iter) ) return; 
+  else if( Absyn::is_throwsany(iter) )
+  {
+	  register_exp_throwsany(fenv,e);
+  }
+  else
+  {
+	  let x = *safe_cast(te->fenv->throws,"add_env_exn");
+	  let qvs = List::map(conv,iter);
+	  register_exp_succs(te->fenv,e,qvs);
+	  for( ; iter != NULL ; iter = iter->tl ) 
+			x->hd = add_qvar(x->hd,throws_hd2qvar(iter));
+  }
+}
+
+static $(qvar_opt_t,int) etyp2qvar(exp_t e )
+{
+	let t = Tcutil::compress(safe_cast(e->topt,"etyp2qvar"));
+	switch(Tcutil::compress(t))
+	{
+		case &PointerType(PtrInfo{t1,...}):
+			t1 = Tcutil::compress(t1);
+			switch(t1)
+			{
+			  case  &AppType(&DatatypeFieldCon(tuf_info),
+			  						ts):
+			    switch(tuf_info) 
+				 {
+				    case {.UnknownDatatypefield = 
+					 					UnknownDatatypeFieldInfo
+										(tname,fname,is_x)}:
+					      fallthru(tname,is_x,fname);
+				    case {.KnownDatatypefield = 
+					 			$(&Datatypedecl
+									(_,tname,_,_,is_x),
+            			 &Datatypefield(fname,_,_,_))}: return $(fname,0);
+   			 } 
+				 break;			
+			   case  &AppType(&DatatypeCon(_ ),_):
+					switch(e->r)
+					{
+						case &Var_e(&Local_b(&Vardecl{_,name,...})):
+							//HACK ALERT: This is a nasty hack. We assume that
+							// the "exn" inserted in tcstmt.cyc is the same as 
+							//the one in absyn.cyc. We ignore automagically 
+							//inserted stuff, which have no run-time effect
+							if(*((*name)[1]) == exnstr()) return $(NULL,1);
+							return $(NULL,2);
+						default: return $(NULL,3); 
+					}
+			  default:Warn::impos("etyp2qvar : %s",Absynpp::typ2string(t));
+		  }
+		 break;
+  		 default:  Warn::impos("etyp2qvar : %s.",Absynpp::typ2string(t));
+	}
+}
+
+static void add_exception(env_t te, exp_t e0, exp_t e )
+{
+  let $(q,b) = etyp2qvar(e);
+  if( q != NULL)
+    add_env_exn(te->fenv,e0,q);
+  else switch(b)
+  {
+	case 1:break;
+	default:	register_exp_throwsany(te->fenv,e); break;
+	 /*
+	 case 2: register_exp_throwsany(te->fenv,e); break; //no data flow analysis. loose precision
+	 case 3: let n = get_exp(te->fenv,e);
+				if( n->throwsany ) register_exp_throwsany(te->fenv,e); 
+				else if( n->throws ) register_exp_succs(te->fenv,e,n->throws);
+				else printf("\nNo analysis for exp at %d", e->loc);
+		break;
+	 default: break; //ignore exn
+    */
+  }
+}
+
+static void insert_badalloc_check( fenv_t env, exp_t e)
+{
+   if( get_debug() )	Warn::warn(e->loc,"inserted bad alloc check.");
+	add_env_exn(env,e,Absyn::get_qvar(Absyn::De_AllocCheck));
+}
+
+static void insert_null_check( fenv_t env, exp_t e, string_t msg)
+{
+	if( get_debug() )
+	Warn::warn(e->loc,"inserted NULL check (%s, expression = %s).",msg,
+						Absynpp::exp2string(e));
+//	else 
+//		Warn::warn(e->loc,"inserted NULL check.");
+
+	add_env_exn(env,e,Absyn::get_qvar(Absyn::De_NullCheck));
+}
+
+static void insert_array_bounds_check( fenv_t env, exp_t e)
+{
+	 if( get_debug() )Warn::warn(e->loc,"inserted BOUNDS check.");
+	add_env_exn(env,e,Absyn::get_qvar(Absyn::De_BoundsCheck));
+}
+
+static void insert_match_check( fenv_t env, exp_t e)
+{
+	 if( get_debug() )Warn::warn(e->loc,"inserted MATCH check.");
+	add_env_exn(env,e,Absyn::get_qvar(Absyn::De_PatternCheck));
+}
+
+static void insert_array_bounds_null_check( fenv_t env , exp_t e)
+{
+	 if( get_debug() )Warn::warn(e->loc,"inserted BOUNDS and NULL check.");
+	add_env_exn(env,e,Absyn::get_qvar(Absyn::De_BoundsCheck));
+	add_env_exn(env,e,Absyn::get_qvar(Absyn::De_NullCheck));
+}
+
+static bool is_tagged_union_project( Absyn::exp_t e2 )
+{
+	    type_t   ignore_typ  = void_type;
+	    bool     ignore_bool = false;
+	    int      ignore_int  = 0;
+       return
+		 (Toc::is_tagged_union_project(e2,&ignore_int,&ignore_typ,true)) ;
+}
+
+static bool  is_zero_ptr_deref(exp_t e )
+{
+  type_t ptr_type = void_type;
+  type_t elt_type = void_type;
+  bool is_fat = false;
+  return Tcutil::is_zero_ptr_deref(e,&ptr_type,&is_fat,
+											  &elt_type);
+}
+
+
+// absyn_annot_t is an extensible data type and
+// should be one of the following:
+//  &InsertChecks::NoCheck, &InsertChecks::NullOnly,
+//  &InsertChecks::NullAndFatBound,
+//  &InsertChecks::FatBound,
+//  &InsertChecks::NullAndThinBound(e),
+//  &InsertChecks::ThinBound(e)
+
+// Add exceptions that may be generated from an expression
+// including exceptions generated by run-time checks
+// check whether they are caught and if not whether
+// the function spec agrees with the exn thrown
+// if caught register successor nodes of throwing node
+static void add_check_exception( env_t env,
+											Absyn::exp_t e, 
+										   Absyn::absyn_annot_t annot )
+{
+  let   old_typ = Tcutil::compress(safe_cast(e->topt,
+												"add_check_exception"));
+  let fenv =  env->fenv;
+  int what = 0;
+ 
+//	printf("\nExpression : %s annotation : %s pointer type? %d\n",
+//				 Absynpp::exp2string(e),annot2string(annot),
+//				 Tcutil::is_pointer_type(old_typ));
+
+  switch(old_typ) 
+  {
+    case &PointerType(PtrInfo{ta,tq,PtrAtts(_,nbl,b,zt,_)}):
+	    switch(annot) 
+		 {
+    		case &InsertChecks::NullOnly: 
+			//	let nullable = Tcutil::force_type2bool(false,nbl);
+			//	if( nullable )
+					insert_null_check(fenv,e,"debug info: 1");
+				break;
+// 0 = _check_known_subscript_notnull_e;
+// 1 = _check_known_subscript_null_e;
+    		case &InsertChecks::NullAndThinBound(bd): 
+					what=1;
+					fallthru(bd);
+		   case &InsertChecks::ThinBound(bd):
+		      let $(i,valid) = Evexp::eval_const_uint_exp(bd);
+		      if(valid && i == 1 && 
+					Tcutil::is_zeroterm_pointer_type(old_typ)
+					)
+				{
+					if(!Toc::is_zero(bd) )
+					{
+						if( what == 1 )
+							insert_array_bounds_null_check(fenv,e);
+					}
+					else if( what == 0 )
+							insert_array_bounds_check(fenv,e);
+					else if( what == 1 )
+							insert_array_bounds_null_check(fenv,e);
+				}
+			   else
+				{  
+					if(what == 0 ) insert_array_bounds_check(fenv,e);
+					else if( what == 1 )
+							insert_array_bounds_null_check(fenv,e);
+				}
+			   break;
+		   case &InsertChecks::NullAndFatBound: fallthru;
+    		case &InsertChecks::FatBound:
+				 insert_array_bounds_check(fenv,e);
+				 break;
+			default: break;
+		 }
+		 break;
+	 default: break;
+  }
+  //	
+  switch(e->r)
+  {
+	 case &Throw_e(e1,...): add_exception(env,e,e1);	break;
+  	 case &Malloc_e(_): fallthru;
+  	 case &New_e(_,_): insert_badalloc_check(fenv,e); break;
+	 case &FnCall_e(e1,_,_,_,_):
+		if( Toc::do_null_check(e) ) insert_null_check(fenv,e,"debug info: 2");
+	   type_t ftyp = safe_cast(e1->topt,"exp");
+	   let i = fn_type(ftyp);add_throws(env,e1); 	break;
+		break;
+  	 case &Cast_e(new_typ,e1,user_inserted,coercion):
+	    type_t old_t2  = safe_cast(e1->topt,"add_check_exception");
+	   // type_t old_t2_c = Toc::typ_to_c(old_t2); //FIXME
+	    switch ($(Tcutil::compress(old_t2),Tcutil::compress(new_typ))) 
+   	 {
+	 	   case $(&Absyn::PointerType(p1),&Absyn::PointerType(p2)):
+	      let b1  = Tcutil::get_bounds_exp(bounds_one(),
+														p1.ptr_atts.bounds);
+	      let b2  = Tcutil::get_bounds_exp(bounds_one(),
+														p2.ptr_atts.bounds);
+//	printf("\nannotation : %s \n",
+//				 annot2string(e->annot));
+
+		//	printf("\nBounds : b1=%s b2=%s\n", b1!=NULL?
+		//												Absynpp::exp2string(b1):(string_t)"nil",
+		//												 b2!=NULL?
+		//												Absynpp::exp2string(b2):(string_t)"nil");
+	      switch($(b1,b2)) 
+			{
+	        case $(&_, &_):
+				if(Toc::do_null_check(e)) insert_null_check(fenv,e,"debug info: 3");
+				break;
+	        case $(NULL, &_): 
+				if(Toc::do_null_check(e)) insert_null_check(fenv,e,"debug info: 4");
+				break;
+		     default: break;
+		   }
+		   break;
+			default: break;
+		 }
+		 break;
+
+   case &Increment_e(e2,incr): 
+    	 type_t elt_typ = void_type;
+		 if( is_tagged_union_project(e2))	fallthru(e2,NULL);
+	    else 
+		 if( !Tcutil::is_fat_pointer_type_elt(old_typ,&elt_typ) &&
+    		  Tcutil::is_zero_pointer_type_elt(old_typ,&elt_typ) && 
+			 ( incr != Absyn::PostInc )
+		   )
+	  		 insert_array_bounds_check(fenv,e2);
+		break;
+  	case &AssignOp_e(e1,popt,_):
+	 if (is_tagged_union_project(e1) && popt != NULL )
+			insert_match_check(fenv,e1);
+			break;
+    if (is_zero_ptr_deref(e1)) 
+ 			insert_array_bounds_check(fenv,e1);
+	 break;
+
+  case &AggrMember_e(e1,_,is_tagged,is_read): 
+		fallthru(e1,is_tagged,is_read);
+  case &AggrArrow_e(e1,_,is_tagged,is_read):
+ 	 if (is_tagged && is_read ) insert_match_check(fenv,e1);
+    break;
+//
+//insert_array_bounds_check
+	 default: break;
+  }
+}
+
+///////////////////////////////////////////
+static string_t q2string( qvar_t q )
+{
+ static qvar_opt_t any = NULL;
+  if(!any) any =  throws_hd2qvar(throwsany());
+  
+  if( strptrcmp((*any)[1],(*q)[1]) == 0 )  return "<any exception>";
+  else return Absynpp::qvar2string(q);
+}
+
+static string_t qvl2string( list_t<qvar_t,`H> l )
+{
+  if( l == NULL ) return "";
+  let x = aprintf("{%s", q2string(l->hd));
+  for( l = l->tl  ; l != NULL ; l = l->tl )
+  {
+		 x = aprintf("%s,%s",x,q2string(l->hd));
+  }
+  return aprintf("%s}",x);
+}
+///////////////////////////////////////////////
+void push_throws_scope( env_t te  )
+{
+	let fenv = te->fenv;
+ 	*(fenv->throws) = new List(NULL,*fenv->throws);
+}
+
+void pop_throws_scope( env_t te , node_t n)
+{
+  	let fenv = te->fenv;
+	if( *fenv->throws == NULL ) 
+		env_err("IOEffect::pop_throws_scope");
+  else
+  {
+	 let hd = (*fenv->throws)->hd;
+	 set_throws( n, hd );
+	 *fenv->throws = (*fenv->throws)->tl;
+	 if( *fenv->throws != NULL && (*fenv->throws)->hd != NULL )
+			for(  ; hd != NULL ; hd = hd->tl ) 
+				(*fenv->throws)->hd = add_qvar((*fenv->throws)->hd,hd->hd);
+  }
+}
+
+///////////////////////////////////////////////////
+#define LCB {
+#define RCB }
+#define check_constant_effect(x)			(((env_t)x)->const_effect)
+#define must_have_constant_effect(x,y) \
+	(LCB bool tmp = check_constant_effect(x);\
+				 (((env_t)x)->const_effect = (bool)y);\
+				 tmp; RCB)
+static env_t new_env( JumpAnalysis::jump_anal_res_t tables,fenv_t f)
+{
+  return new Env(tables,f,NULL,false,NULL);
+}
+
+#define jump_nodes(env) (((env_t) env)->jlist)
+static void add_jump_node( env_t env , node_t n )
+{
+   env->jlist = new List(n, env->jlist);
+}
+
+static void rem_jump_node( env_t env, node_t n )
+{
+	let iter = env->jlist;
+	nlist_t prev = NULL;
+	for( ;  iter != NULL ; prev = iter, iter = iter->tl ) if( iter->hd == n ) 
+	{
+		if( prev == NULL ) env->jlist = iter->tl;
+		else prev->tl = iter->tl;
+		return;
+	}
+	env_err("rem_jump_node");
+}
+// absyn_annot_t is an extensible data type and
+// should be one of the following:
+//  &InsertChecks::NoCheck, &InsertChecks::NullOnly,
+//  &InsertChecks::NullAndFatBound,
+//  &InsertChecks::FatBound,
+//  &InsertChecks::NullAndThinBound(e),
+//  &InsertChecks::ThinBound(e)
+static void push_annot( env_t env , Absyn::absyn_annot_t annot)
+{
+  env->annot = new List(annot,env->annot);
+}
+
+static void pop_annot( env_t env )
+{
+  if( env->annot == NULL ) env_err("pop_annot");
+  env->annot = env->annot->tl;
+}
+static Absyn::absyn_annot_t peek_annot( env_t env )
+{
+  if( env->annot == NULL ) env_err("peek_annot");
+  return env->annot->hd;
+} 
+
+////////////////////////////////////////////////////
+
+static void analyze_fd( JumpAnalysis::jump_anal_res_t
+								tables,
+							   fndecl_t fd,
+								Position::seg_t loc
+							 );
+
+////
+/// Map : stmt -> list_t stmt
+//			 stmt -> effect
+////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////
+
+// Convert a pattern to a qualified variable
+static qvar_t pat2qvar( pat_t p )
+{
+  switch(p->r)
+  {
+		 case &Pointer_p(p1): return pat2qvar(p1);
+		 case &Datatype_p(_,tuf,_,_): return tuf->name;
+		 case &Wild_p: return default_case_qvar();
+		 default: env_err(aprintf("pat2var: \"%s\"",
+								 			Absynpp::pat2string(p)));
+  }
+}
+/////////////////////////////////////////////////////
+static void check_access(fenv_t fe, Position::seg_t loc, 
+								  effect_t f,  
+								  Absyn::type_opt_t t );
+//extern void iter(void f(`a,`b), table_t<`a,`b> t);
+static bool throws_exp_push( env_t env , exp_t e )
+{   
+  push_annot(env,e->annot);
+  //ioeffect_exp_push(env,e);
+	switch(e->r){
+	  case &Subscript_e(e1,_): fallthru(e1);
+     case &Deref_e(e1):
+			check_access(env->fenv,e1->loc,NULL,e1->topt);
+			break;
+	  default: break;
+	}
+  return true; //traverse the entire tree
+}
+
+static void throws_exp_pop( env_t env , exp_t e ) 
+{
+  pop_annot(env);
+  //check once sub expr have been checked
+  // Add exceptions that may be generated from an expression
+  // including exceptions generated by run-time checks
+  // check whether they are caught and if not whether
+  // the function spec agrees with the exn thrown
+  // if caught register successor nodes of throwing node
+  add_check_exception(env,e,peek_annot(env)); 
+  //ioeffect_exp_pop(env,e);
+}
+
+static decl_t stmt2decl( stmt_t s )
+{
+switch(s->r) // could be done better
+			{   case &Decl_s(d,_):  return d;	
+				 default: env_err("stmt2decl");}
+}
+
+// this function is invoked each time a statement node is found on the AST
+static void check_pat_access(fenv_t fe, pat_t pat, effect_t f , Position::seg_t loc );
+
+static bool throws_stmt_push( env_t env, stmt_t s )
+{
+  // if this is a jump-like statement then 
+  // register its successor
+  // doesn't handle exceptions
+  register_stmt_succ(env,s); 
+  // store the annotation related to this statement
+  push_annot(env,s->annot);
+  let fenv = env->fenv;
+  // obtain the node for this statement
+  let n = get_stmt(fenv,s);
+  // store this node 
+  //push_node(env,n); 
+
+  //push_jump_annot(env,get_stmt(env->fenv,s),MayJump);
+
+  switch(s->r)
+  {
+//	  case &Skip_s: set_jump(get_stmt(env->fenv,s),MayJump); break;
+//	  case &Goto_s(_):   fallthru;
+//	  case &Return_s(_): fallthru; 
+//	  case &Break_s: fallthru;
+//	  case &Continue_s:update_jump_annot(env,MustJump); break;
+
+	  //inner declaration
+	  case &Decl_s(&Decl{.r=&Fn_d(fd),...},_): 
+			analyze_fd(env->tables,fd,s->loc); 
+			return false;
+
+  	  // add label v to all enclosing xrgn 
+	  case &Label_s(v,s1):
+				push_label(env->fenv,v);
+				add_enclosed_label(env->fenv, v ,s ); 
+				break;
+
+	  case &TryCatch_s(s1,scs,dtp0):
+		let dtp = safe_cast(dtp0,"throws_stmt_push");
+
+		//begin catch block
+		push_catch_block(env,s1,dtp);
+		//iterate through cases of catch
+		for(; scs!=NULL; scs=scs->tl){
+   	 let sc = scs->hd;
+	    let body = sc->body;
+		 let pat = sc->pattern;
+		  check_pat_access(env->fenv,pat,NULL,pat->loc);
+		 //ignore default case -- inserted automatically
+		 if( strcmp(Absynpp::pat2string(pat),"exn") == 0) continue;
+			// printf("\nPattern : %s body: \"%s\"\n",
+			//		 Absynpp::pat2string(sc->pattern),
+			//		 Absynpp::stmt2string(sc->body) );	 fflush(stdout);
+
+		 //convert case PATTERN to a qualified variable
+		 //let q = pat2qvar(pat);
+		 // add qualified variable of catch CASE to all enclosing xrgn
+	    //add_enclosed_catch(env->fenv,q,body);
+   	}
+		break;
+
+	 case &Decl_s(&Decl{.r=&Let_d(pat,_,_,_),...},_):
+			check_pat_access(env->fenv,pat,NULL,pat->loc);
+			break;
+	  // if this is an xrgn block then we care about it
+     case	  &Decl_s(&Decl{.r=&Region_d(tv,_,eo),...},_): 
+			if(is_xrgn_tvar(tv))	// register enclosing xrgn
+				push_enclosing_xrgn(env,stmt2decl(s));
+		   break;
+	  default: break;
+  }
+  return true;
+}
+
+/*static void update_labels( env_t env, stmt_t s )
+{
+   let f = env->fenv;
+   get_stmt(f,s)->contains_labels = List::copy(f->labels);
+}*/
+
+static void throws_stmt_pop( env_t env, stmt_t s )
+{
+  //pop_jump_annot(env);
+  pop_annot(env);
+  //update_labels(env,s);
+  switch(s->r)
+  {
+	  case &Label_s(v,s1):
+				pop_label(env->fenv);
+				break;
+/*
+	  case &IfThenElse_s(e1,s1,s2):
+			let n1 = get_jump(get_exp(env->fenv,e1));
+			if( n1 == MustJump ) update_jump_annot(env,MustJump);
+			else
+			{
+				let n2 = get_jump(get_stmt(env->fenv,s1));
+				let n3 = get_jump(get_stmt(env->fenv,s2));
+				if( n2 == MustJump && n3 == MustJump )
+					 update_jump_annot(env,MustJump);
+				else if( n2 == MayJump || n3 == MayJump || n1 == MayJump)
+					 update_jump_annot(env,MayJump);
+				else update_jump_annot(env,MayJump);
+			}
+			break;
+*/
+	  //remove enclosing xrgn
+     case &Decl_s(&Decl{.r=&Region_d(tv,_,eo),...},_) && eo != NULL && 
+		 ((int) eo->loc) < 0: 
+			pop_enclosing_xrgn(env);break;
+	  default: break;
+  }
+  cond_pop_catch_block(env,s); // pop if try block
+ // pop_node(env); 
+}
+
+
+/////////////////////////////////////////////////////
+/////// SECOND PASS: IOEFFECT 
+////////////////////////////////////////////////////
+static bool region_accessible( Absyn::type_t r, effect_t e  );
+static bool region_live( Absyn::type_t r,effect_t e);
+typedef $(type_t,type_t,type_t,effect_t,effect_t, 
+			list_t<tvar_t>,throws_t,reentrant_t,attributes_t) finfo_t;
+
+static finfo_t  extract_fun_type_info(type_t ftyp){
+   switch (ftyp) 
+   {
+   	case &FnType(FnInfo{.tvars=tvs,.effect=e1,.ieffect=ieff,	
+								  .oeffect=oeff,.throws=t,.reentrant=r,
+								  .attributes=a,...}):
+			return $(ftyp,void_type,e1,ieff,oeff,tvs,t,r,a);
+     case &PointerType(PtrInfo(t,_,PtrAtts(rt,_,_,_,_))):
+	 
+		ftyp = Tcutil::compress(t);
+      switch (ftyp) 
+		{
+      	case &FnType(FnInfo{.tvars=tvs,.effect=e1,.ieffect=ieff,.oeffect=oeff,.throws=t,
+										.reentrant=r,.attributes=a,...}):
+			return $(ftyp,rt,e1,ieff,oeff,tvs,t,r,a);
+			default: env_err("extract_fun_type_info"); 
+	   }
+		break;
+	 default: env_err("extract_fun_type_info");
+	}
+}
+
+static bool reentrant_type_visitor( string_t @ bad, type_t t )
+{
+     switch (t) 
+	  {
+		 /*
+		 case &PointerType(PtrInfo{
+				&FnType(FnInfo{_,e,_,r,args,_,va,qb,_,_,_,_,_,_,_,_,_})							, _,PtrAtts(&AppType(&HeapCon,_),_,_,_,_)}):
+				return false;
+		*/
+	    //may containt `H so stop search (return false)
+		 case &AppType(&AccessCon,_):
+		 case &AppType(&CAccessCon,_): return false;
+       case &AppType(&HeapCon,_): 
+       case &AppType(&RefCntCon,_): 
+       case &AppType(&UniqueCon,_): 
+  		//	 case &AppType(&RgnsCon,_): //PG: Need this?
+		  *bad = aprintf("%s",Absynpp::typ2string(t));
+        return false;
+		 default: return true;
+     }
+}
+
+static void __check_access(fenv_t fenv, Position::seg_t loc, 
+								  effect_t f,  
+								  Absyn::type_opt_t t, bool just_live )
+{
+		if( f == &empty_effect ) f = NULL; //ad-hoc but works
+		if( t == NULL ) Warn::impos("IOEffect::__check_access");
+		let fun = (just_live)?region_live:region_accessible;
+		const char *@fat @notnull errmsg = (const char *@fat @notnull) (just_live?"dead":"inaccessible");
+		bool should_ignore_x = should_ignore_xrgn(fenv); 
+
+		//printf("\nNeed to check : %s\n" , Absynpp::typ2string(t));
+		t = Tcutil::compress(t);
+		if( should_ignore_x ){
+			let $(_,_,_,_,_,_,_,reentrant0,_) =
+						 extract_fun_type_info(fenv->fd->cached_type);
+			bool reentrant = is_reentrant(reentrant0);
+			if( reentrant ){
+				string_t bad = "";
+				let ftyp = fenv->fd->cached_type;
+				Absyn::visit_type(reentrant_type_visitor,&bad,ftyp);
+				if( strcmp(bad,"") != 0 ){ 
+			  			Tcutil::terr(loc,"Cannot use `H, `U,  `RC in @re_entrant functions. Offending type : %s" ,bad);
+				}
+			}
+			return;
+		}
+
+		let rgns = Tcutil::rgns_of(t);
+		switch(rgns){
+			case &AppType(&JoinCon,iter):
+				for(  ; iter != NULL ; iter = iter->tl ){
+				   let t1 = iter->hd;
+//					printf("\nIter : %s | %s", Absynpp::typ2string(t1),typcon2string(t1));
+	
+					if( !just_live && reentrant && is_heaprgn(t1) )
+							Tcutil::terr(loc,"Cannot use pointers allocated at the heap (`H) in @re_entrant functions.");
+
+					switch(t1){
+						case &AppType(&AccessCon,&List(r,_)):
+							let k = Tcutil::type_kind(r);
+							let is_x = Tcutil::kind_eq(k,&Tcutil::xrk);
+							if(is_x ){
+				      		if(!fun(r,f)){
+										Tcutil::terr(loc,"Region %s is %s in effect %s",
+										errmsg,
+										Absynpp::typ2string(r),
+										effect2string(f));
+								}	
+							}
+							break;
+						default: env_err("check_access 1"); 
+					}
+					break;
+		} break;
+		default: env_err("check_access 2"); 
+	}
+
+/*		switch (t)
+		{
+      	 //case &AppType(&RgnHandleCon,&List{r,_}): return;//already checked in tcexp
+      	 case &PointerType(PtrInfo(_,_,PtrAtts(r,...))): 
+				   fallthru(r);
+      	 case &AppType(&RgnHandleCon,&List{r,_}):
+				if( is_xrgn(r)  == false ) break;
+      		if(!region_accessible(r,f))
+				{
+					Tcutil::terr(loc,"Region %s inaccessible in effect %s",
+										Absynpp::typ2string(r),
+										effect2string(f));
+				}
+				break;
+				case &TupleType(_): break;
+			 default: env_err(aprintf("check_access: type = %s",Absynpp::typ2string(t))); //break; //don't care
+		}*/
+}
+static void check_access(fenv_t fe, Position::seg_t loc, 
+								  effect_t f,  
+								  Absyn::type_opt_t t ){
+   __check_access(fe,loc,f,t,false);
+}
+
+static void check_live(fenv_t fe, Position::seg_t loc, 
+								  effect_t f,  
+								  Absyn::type_opt_t t ){
+   __check_access(fe,loc,f,t,true);
+}
+
+static void check_pat_access(fenv_t fe, pat_t pat, effect_t f , Position::seg_t loc ){
+	switch(pat->r){
+		case &Wild_p: break;
+	   case &Var_p(vd,p):
+				check_pat_access(fe,p,f,loc); break;
+      case &Reference_p(vd,p):
+				//check_access(loc,f,vd->type);
+				check_pat_access(fe,p,f,loc); break;
+		case &AliasVar_p(tv,vd): break; //??
+      case &TagInt_p(tv,vd): break;
+		case &Tuple_p(lpat,_):
+				for(  ; lpat != NULL ; lpat = lpat->tl ){
+					check_pat_access(fe,lpat->hd,f,loc);				
+				}
+				break;
+      case &Pointer_p(p):
+				check_access(fe,loc,f,safe_cast(p->topt,"check_pat_access"));
+				check_pat_access(fe,p,f,loc); break; //unecessary?
+    case &Aggr_p(info,tvlist,dplist,_):
+				for(  ; dplist != NULL ; dplist = dplist->tl ){
+					let &$(dlist,p) = dplist->hd;
+					check_pat_access(fe,p,f,loc);				
+				}
+				break;
+	 case &Datatype_p(dcl,fld,patlist,_):
+				for(  ; patlist != NULL ; patlist = patlist->tl ){
+					check_pat_access(fe,patlist->hd,f,loc);				
+				}
+				break;
+	 case &Null_p: break;
+	 case &Int_p(_,_):  break;
+    case &Char_p(_): break;
+	 case &Float_p(...): break;
+    case &Enum_p(_,_): break;
+    case &AnonEnum_p(_,_): break;
+	 default: env_err("check_pat_access");
+   // UnknownId_p(qvar_t); // resolved by binding
+    //UnknownCall_p(qvar_t,list_t<pat_t>, bool dot_dot_dot); //resolved by binding
+    // Exp_p(exp_t);        // evaluated and resolved by tcpat
+  }
+}
+// extract:
+//  (1) allocation region of function
+//  (2) input effect
+//  (3) output effect
+//  (4) type variable list
+static finfo_t extract_fun_ptr_type_info( exp_t e )
+{
+	let ftyp = Tcutil::compress(safe_cast(e->topt,"extract_fun_ptr_type_info_e"));
+	return extract_fun_type_info(ftyp);
+}
+
+static bool check_effect(type_t e1 ) 
+{
+  let comp = Tcutil::compress(e1);
+  switch (comp) 
+  {
+   case &AppType(&HeapCon,_): 
+   case &AppType(&RefCntCon,_): 
+   case &AppType(&UniqueCon,_): 
+   case &AppType(&AccessCon,_): 
+   case &VarType(_): 
+   case &Evar(...): 
+   case &AppType(&RgnsCon,_): return false; 
+   case &AppType(&JoinCon,es):
+    for (; es != NULL; es = es->tl)
+      if (!check_effect(es->hd))	return false;
+      return true;
+   case &AppType(&CAccessCon,r2): return true; 
+   default: Warn::impos("check_effect: bad effect: e1=%s",
+						Absynpp::typ2string(e1));
+  }
+}
+
+
+static bool thread_type_visitor( string_t @ bad, type_t t )
+{
+	//	printf("\nVisiting type : %s\n", Absynpp::typ2string(t));
+     switch (t) 
+	  {
+		 /*
+		 case &PointerType(PtrInfo{
+				&FnType(FnInfo{_,e,_,r,args,_,va,qb,_,_,_,_,_,_,_,_,_})							, _,PtrAtts(&AppType(&HeapCon,_),_,_,_,_)}):
+				return false;
+		*/
+	    //may containt `H so stop search (return false)
+		 case &AppType(&CAccessCon,_): return false;
+       case &AppType(&HeapCon,_): 
+       case &AppType(&RefCntCon,_): 
+       case &AppType(&UniqueCon,_): 
+		 case &AppType(&AccessCon,_):
+  		//	 case &AppType(&RgnsCon,_): //PG: Need this?
+		  *bad = aprintf("%s",Absynpp::typ2string(t));
+        return false;
+		 default: return true;
+     }
+}
+
+
+static void check_no_normal_regions_in_thread
+								(seg_t loc, fn_info_t @ info ,type_t ftyp)
+{
+  if( info->c_varargs ) //TODO: too restrictive ?
+  {
+	  Tcutil::terr(loc,"Cannot spawn a thread that accepts variable arguments : %s"	,	Absynpp::typ2string(ftyp));
+  }
+/*
+	if( eff != NULL && check_effect(eff) == false )
+	{
+	  let rgs =  Tcutil::rgns_of(ftyp);
+	  let str = Absynpp::typ2string(rgs);
+		  Tcutil::terr(loc,"Cannot spawn a thread that uses normal regions: %s"						 ,str);
+  }
+*/
+   let eff = info->effect;
+	if( eff  == NULL ) return;
+	eff = Tcutil::compress(eff);
+	if( check_effect(eff) == false ) 
+	{
+		  let str = Absynpp::typ2string(eff);
+		  Tcutil::terr(loc,"Cannot spawn a thread that has a non-empty effect of \"ordinary\" regions: %s"	 , str);
+	}
+	string_t bad = "";
+	Absyn::visit_type(thread_type_visitor,&bad,ftyp);
+	if( strcmp(bad,"") != 0 )
+	{ 
+		  let rgs =  Tcutil::rgns_of(ftyp);
+		  let str = Absynpp::typ2string(rgs);
+		  Tcutil::terr(loc,"Cannot spawn a thread that uses `H, `U,  `RC or \
+traditional regions%s. Offending type : %s"	 , strcmp(str,"{}") == 0 ?"": 
+											aprintf(" (function effect: %s)",str),bad);
+	}
+}
+
+static bool is_region_kind( tvar_t tv )
+{
+ switch(tv->kind)
+ {
+	case &Eq_kb(k):
+ 		return Tcutil::kind_leq(k,&Tcutil::trk);
+	//FIXME: Hmm... do I need to check the following ?
+    //Less_kb(opt_t<kindbound_t>, kind_t);
+	default: return false;
+ }
+}
+
+static $(type_t,bool)  check_fun_call_ptr(env_t env, exp_t e ,
+											 bool spwn, Position::seg_t loc )
+{
+	let $(ftyp,rt,eff,ieff,oeff,tvs,throws,reentrant,att) = extract_fun_ptr_type_info(e);
+   bool noreturn = false;
+
+	//printf("\nChecking call to : %s\n" , Absynpp::exp2string(e));	
+
+   if(  tvs != NULL )
+	  Tcutil::terr(loc,"Cannot call a partially instantiated function.");
+	
+	if( spwn )
+	{
+		if( !is_reentrant(reentrant) )
+	   	Tcutil::terr(loc,"Thread function type is not @re_entrant: %s",
+											Absynpp::typ2string(ftyp));
+		if( !is_heaprgn(rt) )
+			Tcutil::terr(loc,"Cannot pass an non Heap function pointer to spawn.");
+
+		if( oeff != NULL )
+		  Tcutil::terr(loc,"Spawn operation: Function type %s must have an empty (or no)  @oeffect anotation"	,Absynpp::typ2string(ftyp));
+
+		if( Absyn::is_nothrow(throws) == false )
+		  Tcutil::terr(loc,"Spawn operation: Function type %s must be @nothrow"	,	Absynpp::typ2string(ftyp));
+		switch(ftyp)
+		{
+			case	&FnType(info):
+				check_no_normal_regions_in_thread(loc,&info,ftyp);
+				break;
+			default:
+				env_err("check_fun_call_ptr");
+		}
+	}
+	else
+	{
+		let t = Tcutil::rgns_of(eff);
+		switch(t){
+			case &AppType(&JoinCon,iter):
+				for(  ; iter != NULL ; iter = iter->tl ){
+					//printf("\nIter : %s | %s", Absynpp::typ2string(iter->hd),
+					//			typcon2string(iter->hd));
+					switch(iter->hd){
+						case &AppType(&AccessCon,&List(r,_)):
+							let k = Tcutil::type_kind(r);
+							if( Tcutil::kind_eq(k,&Tcutil::xrk) ){
+								  Tcutil::terr(loc,"Passing an X-Region effect as a traditional Cyclone effect is disallowed. Offending region : %s.",Absynpp::typ2string(r));
+						   }
+								//else printf(" --- Not an tvar");
+								//printf("\n");
+							break;
+						default: 
+								//printf("\nNot even an AccessCon\n");
+								break;
+					}
+					//	printf("\nRegions of: %s\n" ,
+					//		 Absynpp::typ2string(iter->hd));
+				}
+				break;
+		   default: env_err("check_fun_call_ptr");
+		}
+// use eff
+//bool is_defined_xrgn(fenv_t f, type_t name )
+		for( ; att != NULL ; att = att->tl )
+		{
+			if(!attribute_cmp(att->hd,&Absyn::Noreturn_att_val))
+			{
+				noreturn = true; break;
+			}
+		}
+	}
+
+  /*
+	else
+	{
+	  let xrgn;
+	  let isxrgn;
+	  if( spwn ) // only xrgn and `H can be passed
+	  {
+		}
+		else
+		{
+			for( ; tvs != NULL ; tvs = tvs->tl )
+			{  
+			   xrgn = tvs->hd;
+				// don't care about non-region type variables
+				if(!is_region_kind(xrgn) ) continue;
+	  			// check --> FIXME: I think this check has already been performed
+				if(is_xrgn(xrgn) && find_rgneffect(xrgn , ieff ) == NULL)
+				{
+			  	 Tcutil::terr(loc,"Function was instantiated with an xregion that is not specified in @ieffect.");
+				}
+			}
+		}
+	 }
+   */
+   return $(ftyp,noreturn);
+}
+
+///////////////////////////////////////////////////////////////
+static effect_t check_parent_add_child( type_t r , type_t typ, 
+													effect_t f,seg_t loc )
+{
+	if( f == &empty_effect ) f = NULL;
+	switch(typ)
+	{
+	 case &AppType(&RgnHandleCon,ts) && ( ts->hd == heap_rgn_type ): 
+		typ = heap_rgn_type;
+		break;
+	 case &AppType(&RgnHandleCon,ts):
+		typ = ts->hd;
+		if(  find_rgneffect(Absyn::type2tvar(ts->hd),f) == NULL )
+		{
+			  Tcutil::terr(loc,"Invalid parent region handle %s",
+								Absynpp::typ2string(typ));
+		}
+		break;
+	 default: env_err("check_parent_add_child");
+
+	}
+	//sanity check
+	if(  find_rgneffect( type2tvar(r),f) != NULL )
+		env_err("check_parent_add_child");
+   return new_rgn_effect(r,typ,f);
+}
+
+//////////////////////////////////////////////////////////////
+typedef datatype JmpSummary @ js_t;
+datatype JmpSummary
+{
+	Break_js;
+	Continue_js;
+	Fallthru_js(stmt_t);
+	Goto_js(var_t);
+	Throw_js(exp_t);
+	Return_js;
+	NoJump_js;
+	Or_js(js_t,js_t);
+};
+
+static datatype JmpSummary.Break_js break_js = Break_js;
+static datatype JmpSummary.Continue_js continue_js = Continue_js;
+static datatype JmpSummary.Return_js return_js = Return_js;
+static datatype JmpSummary.NoJump_js nojump_js = NoJump_js;
+
+//constructors
+#define break_js_t 		((js_t)&break_js)
+#define continue_js_t	((js_t)&continue_js)
+#define return_js_t		((js_t)&return_js)
+#define nojump_js_t		((js_t)&nojump_js)
+#define goto_js_t(x)		((js_t) new Goto_js((var_t)x))
+#define throw_js_t(x)		((js_t) new Throw_js((exp_t)x))
+
+js_t join_js( js_t j1 , js_t j2 )
+{
+	switch($(j1,j2))
+	{
+		case $(&Return_js,_): fallthru;
+		case $(_,&Return_js): return return_js_t;
+		case $(&Break_js,&Break_js): return break_js_t;
+		case $(&Continue_js,&Continue_js): return continue_js_t;
+		case $(&NoJump_js,&NoJump_js): return nojump_js_t;
+		case $(&Fallthru_js(s1),&Fallthru_js(s2)) && s1 == s2: return j1;
+		case $(&Goto_js(s1),&Goto_js(s2)) && s1 == s2: return j1;
+		case $(&Throw_js(s1),&Throw_js(s2)) && s1 == s2: return j1;
+	   default: return new Or_js(j1,j2); 
+	}
+
+}
+//////////////////////////////////////////////////////////////
+
+static void ioeffect_stmt( env_t env , stmt_t s );
+static void ioeffect_exp( env_t env , exp_t e );
+/////////////////////////////////////////////////////////////
+typedef struct Contains
+						 { bool found; 
+							var_opt_t v;
+							stmt_opt_t s;
+						 } contains_t;
+
+static bool contains_e( contains_t @`r ret, exp_t e )
+{ return true; }
+
+static bool contains_s( contains_t @`r ret, stmt_t s )
+{
+	 if( s == ret->s ) goto OK;
+	 else 
+	 {
+		let v = ret->v;
+		if( v != NULL ) switch(s->r)
+		{
+			case &Label_s(v1,_):
+				if( strptrcmp(v,v1) == 0 ) goto OK; break;
+			default: break;
+	   }
+		else return false;
+	 }
+	 return true;
+   OK:
+		ret->found = true;
+		return false;
+}
+
+static bool contains_label( stmt_t s, var_t v )
+{
+	contains_t c = Contains(false,v,NULL);
+	visit_stmt(contains_e,contains_s,&c,s);
+	return c.found;
+}
+
+static bool contains_statement( stmt_t s, stmt_t s1 )
+{
+	contains_t c = Contains(false,NULL,s1);
+	visit_stmt(contains_e,contains_s,&c,s);
+	return c.found;
+}
+/////////////////////////////////////////////////////////////////////////
+bool iter_jump_list( bool (@cb)(node_t,`a e), env_t env, `a e )
+{
+	let iter = jump_nodes(env);
+	list_t<node_t,`H> prev=NULL;
+	let n;
+	bool ret = false;
+	for( ; iter != NULL ; prev = iter, iter = iter->tl )
+	{
+		n = iter->hd;
+		if( cb(n,e) )
+		{
+			ret = true;
+			if( prev == NULL ) jump_nodes(env) = iter->tl;
+			else prev->tl = iter->tl;
+		}
+	}
+	return ret;
+}
+
+// remove throw statements that get caught
+bool remove_throw( node_t n,list_t<switch_clause_t> scs)
+{
+	switch(n->n)
+	{
+		case &Exp(e):
+			switch(e->r)
+			{
+				case &Throw_e(_,_): 
+				let iter = get_node_succ(n); // handlers
+				for( ; iter != NULL ; iter->tl )
+				{
+				  let ns = iter->hd;
+				  switch(ns->n)
+				  {
+					 case &Stmt(s):
+						let iter2 = scs;//find handler in scs handler list
+						for( ; iter2 != NULL && iter2->hd->body != s ;
+								 iter2 = iter2->tl);
+						if( iter2 == NULL ) return false;
+						break;
+					 case &Exp(_): break;// error ?
+				 }
+				}
+				return true; // ok all handlers found
+				default: return false;
+   		}
+		default: return false;
+	}
+}
+
+//remove gotos that jump within the scope of statement s
+static bool remove_gotos( node_t n, stmt_t s)
+{
+	switch(n->n)
+	{
+		case &Stmt(&{.r=&Goto_s(x),...}):
+			return contains_label(s,x);
+		default: return false;
+	}
+}
+
+//remove jumps that
+static bool remove_loop_jump( node_t n, void *z)
+{	
+	switch(n->n)
+	{
+		case &Stmt(&{.r=&Continue_s,...}):  return true;
+		case &Stmt(&{.r=&Break_s,...}): return true;
+		default: return false;
+	}
+}
+
+static bool remove_pattern_jump( node_t n, void *z)
+{	
+	switch(n->n)
+	{
+		case &Stmt(&{.r=&Break_s,...}): return true;
+		case &Stmt(&{.r=&Fallthru_s(...),...}): return true;
+		default: return false;
+	}
+}
+
+/*static bool check_pattern_jump_effect( node_t n, void *z)
+{	
+	switch(n->n)
+	{
+		case &Stmt(&{.r=&Break_s,...}): 
+		case &Stmt(&{.r=&Fallthru_s(...),...}): 
+		default: return false;
+	}
+   return false;
+}*/
+
+/////////////////////////////////////////////////////////////////////////
+
+// Macros make our life easier
+#define propagate_node(nf,env,na,loc) \
+   ( LCB \
+  	  set_input_effect((node_t)na,(effect_t)nf,(seg_t)loc);\
+ 	  switch(((node_t)na)->n) \
+	  LCB \
+		case &Stmt(s): ioeffect_stmt(((env_t)env),s); break; \
+		case &Exp(e): ioeffect_exp(((env_t)env),e); break;  \
+     RCB; \
+	  $(get_output(na),get_node_jump(na));\
+   RCB)
+
+#define propagate_node_noinput(nf,env,na,loc) \
+   ( LCB \
+ 	  switch(((node_t)na)->n) \
+	  LCB \
+		case &Stmt(s): ioeffect_stmt(((env_t)env),s); break; \
+		case &Exp(e): ioeffect_exp(((env_t)env),e); break;  \
+     RCB; \
+	  $(get_output(na),get_node_jump(na));\
+   RCB)
+
+#define snode(env,x) get_stmt(((env_t)env)->fenv,(stmt_t)x)
+#define enode(env,x) get_exp(((env_t)env)->fenv,(exp_t)x)
+
+#define  return_if_must_jump(n,jmp) \
+ if( jmp != MayJump ){ set_node_jump(n,jmp); goto RETURN;}
+
+#define  return_if_MUST_jump(n,jmp) \
+ if( jmp == MustJump ){ set_node_jump(n,MustJump); goto RETURN;}
+#define must_jump(j) (j != MayJump)
+
+static  $(effect_t,nannot_t) 
+propagate_s_noinput(effect_t nf, env_t env, 
+					stmt_t s1 , seg_t loc )
+{	
+		#ifdef PROPAGATE_S_DBG	  
+			printf("\n------> propagate_s : %s @@@@ input %s \n",
+			 Absynpp::stmt2string(s1),Absyn::effect2string(nf));
+			  fflush(stdout);
+		#endif
+			let $(a,b) = propagate_node_noinput(nf,env,snode(env,s1),loc);
+			//let fenv = env->fenv;
+			//let ns1 = get_stmt(fenv,s1);
+			//set_input_effect(ns1,nf,loc);
+			//ioeffect_stmt(env,s1);
+			//let o = get_output(ns1);
+		#ifdef PROPAGATE_S_DBG	  
+			printf("<-------- %s @@@ output = %s\n\n",
+						Absynpp::stmt2string(s1),Absyn::effect2string(a));
+			fflush(stdout);
+		#endif
+			return $(a,b);
+}
+
+
+static  $(effect_t,nannot_t) 
+	propagate_s(effect_t nf, env_t env, 
+					stmt_t s1 , seg_t loc )
+{	
+		#ifdef PROPAGATE_S_DBG	  
+			printf("\n------> propagate_s : %s @@@@ input %s \n",
+			 Absynpp::stmt2string(s1),Absyn::effect2string(nf));
+			  fflush(stdout);
+		#endif
+			let $(a,b) = propagate_node(nf,env,snode(env,s1),loc);
+			//let fenv = env->fenv;
+			//let ns1 = get_stmt(fenv,s1);
+			//set_input_effect(ns1,nf,loc);
+			//ioeffect_stmt(env,s1);
+			//let o = get_output(ns1);
+		#ifdef PROPAGATE_S_DBG	  
+			printf("<-------- %s @@@ output = %s\n\n",
+						Absynpp::stmt2string(s1),Absyn::effect2string(a));
+			fflush(stdout);
+		#endif
+			return $(a,b);
+}
+
+static $(effect_t,nannot_t) propagate_e(effect_t nf, env_t env, exp_t e , 
+										 seg_t loc )
+{
+		#ifdef PROPAGATE_E_DBG
+		   printf("\npropagate_e : %s is %s\n",
+			Absynpp::exp2string(e),Absyn::effect2string(nf));
+			fflush(stdout);
+		#endif
+		return propagate_node(nf,env,enode(env,e),loc);
+			//let fenv = env->fenv;
+			//let ne = get_exp(fenv,e);
+			//set_input_effect(ne,nf,loc);
+			//ioeffect_exp(env,e);	
+			//return $(get_output(ne),get_node_jump(ne));
+}
+
+// effects occasionally need to be constant
+void checked_set_output_effect(env_t env, node_t n , effect_t out)
+{
+	// throw an error if it is supposed to be constant but it isn't
+	if( check_constant_effect(env) &&
+		 cmp_effect(out,get_input(n)) == false )
+	{
+		Tcutil::terr(node_seg(n),
+				"Effect should be constant within expression/statement");
+		out = get_input(n); // forgive 
+	}
+	set_output_effect(n,out); //set it in any case
+}
+
+static void propagate_if_n_n_n_n(effect_t nf, env_t env, 
+								  node_t n1, node_t n2, node_t n3,seg_t loc,
+								  node_t ifn )
+{
+  {
+	let $(f1,jmp1) = propagate_node(nf,env,n1,loc);
+	return_if_must_jump(ifn,jmp1);
+	loc = node_seg(n1);
+	let $(f2,jmp2) = propagate_node(f1,env,n2,loc);
+	let $(f3,jmp3) = propagate_node(f1,env,n3,loc);
+	switch($(jmp2,jmp3))
+	{
+	  case $(MustJump,MustJump):
+		return_if_must_jump(ifn,MustJump);
+		break;
+	  case $(MayJump,MayJump): // conservative approximation
+		checked_set_output_effect(env,ifn,f2);
+		checked_set_output_effect(env,ifn,f3);
+		break;
+	  case $(MayJump,_):checked_set_output_effect(env,ifn,f2); break;
+	  case $(_,MayJump):checked_set_output_effect(env,ifn,f3); break;
+	  default: env_err("propagate_if_n_n_n_n: impossible");
+	}
+ } // jump analysis glitch - don't remove brackets
+  RETURN: return;
+}
+
+// propagate effects within loops
+static void propagate_loop_e_e_s_e_s_n( effect_t nf, env_t env,
+													 exp_opt_t e1, exp_opt_t e2,
+													 stmt_t body, exp_opt_t e3,
+													 stmt_t cont, seg_t loc, node_t n)
+{
+   {
+		//nannot_t jmp = MayJump;
+		effect_t output_effect = NULL;
+
+		if( e1 != NULL )
+		{
+			let $(f1,jmp1) = propagate_e(nf,env,e1,loc);
+		   return_if_must_jump(n,jmp1);
+			nf = f1;
+			output_effect = nf; //for loop
+			loc = e1->loc;
+		}
+
+		if( e2 != NULL )
+		{
+		  let $(f2,jmp2) = propagate_e(nf,env,e2,loc);
+		  return_if_must_jump(n,jmp2);
+		  // while,for: the effect should be identical to loop input effect
+		  checked_set_output_effect(env,enode(env,e2),nf);
+		  loc = e2->loc;
+		  if( e1 == NULL ) output_effect = nf; //while loop
+		}		
+
+		{
+			propagate_s(nf,env,cont,loc);// "continue" target: set effect
+			let $(f3,jmp3) = propagate_s(nf,env,body,loc);
+			//Do we even need this case? makes the analysis a bit more precise
+		   if( iter_jump_list(remove_loop_jump,env,NULL) == false &&
+				 jmp3 == MustJump)  return_if_must_jump(n,MustJump);
+		   checked_set_output_effect(env,snode(env,body),nf); //conservative...
+			loc = body->loc;
+		}
+
+		if( e3 != NULL )
+		{
+		  let $(f4,jmp4) = propagate_e(nf,env,e3,loc);
+		  return_if_must_jump(n,jmp4);
+		  checked_set_output_effect(env,enode(env,e3),nf); //conservative ...
+		}
+
+		checked_set_output_effect(env,n,nf);	
+   }
+   RETURN: return;
+}
+
+static $(effect_t,nannot_t) propagate_e_s(effect_t nf, env_t env, exp_t e1 , 
+										stmt_t s2, seg_t loc )
+{
+	let $(f1,ne_annot) = propagate_e(nf,env,e1,loc);
+   return ( ne_annot != MayJump)?$(f1,ne_annot):
+				propagate_s(f1,env,s2,e1->loc);
+}
+
+static $(effect_t,nannot_t) propagate_e_e(effect_t nf, env_t env, exp_t e1 , 
+										exp_t e2, seg_t loc )
+{
+	let $(f1,ne1_annot) = propagate_e(nf,env,e1,loc);
+	return (ne1_annot != MayJump)?$(f1,ne1_annot):propagate_e(f1,env,e2,e1->loc);
+}
+
+static  $(effect_t,nannot_t) propagate_list_e( effect_t nf, env_t env,
+											 list_t<exp_t> l , seg_t loc )
+{
+	for( ; l != NULL ; l = l->tl )
+   {
+		#ifdef PROPAGATE_LIST_E_DBG
+			printf("\nlist_e : %s is %s\n",
+			Absynpp::exp2string(l->hd),Absyn::effect2string(nf));
+			fflush(stdout);
+		#endif
+		let $(nf1,jmp) = propagate_e(nf,env,l->hd,loc);
+		loc = l->hd->loc;
+		if( jmp != MayJump ) return $(nf1,jmp);
+		nf = nf1;
+	}
+	return $(nf,MayJump);
+}
+
+static $(effect_t,nannot_t) propagate_listc_e( effect_t nf, env_t env,
+											  list_t<$(`a,exp_t)@> l,seg_t loc )
+{
+	for( ; l != NULL ; l = l->tl )
+   {
+		let e = (*(l->hd))[1];
+		let $(nf1,jmp) = propagate_e(nf,env,e,loc);
+		loc = e->loc;
+		if( jmp != MayJump ) return $(nf1,jmp);
+		nf = nf1;
+	}
+	return $(nf,MayJump);
+}
+
+static effect_t join_env( Position::seg_t loc,
+								  effect_t env , 
+								  effect_t in,
+								  effect_t out,
+								  bool	  sp
+								);
+//**********************************************************************
+
+static void ioeffect_exp( env_t env , exp_t e )
+{
+   let fenv = env->fenv;
+   let n = get_exp(fenv,e);
+   let nf = get_input(n);
+	let const_nf = nf;
+	switch(e->r)
+	{
+    case &Enum_e(...):  fallthru;
+    case &AnonEnum_e(...):  fallthru;
+    case &Valueof_e(_): fallthru;
+    case &Asm_e(...):  fallthru;
+    case &Extension_e(_):  fallthru;
+    case &Const_e(_): fallthru;
+    case &Sizeoftype_e(_): fallthru;
+    case &Offsetof_e(_,_): fallthru;
+	 case &Var_e(_):  fallthru;
+		  /*
+			switch(b)
+			{
+				case &Funname_b(fd):
+			}
+			checked_set_output_effect(env,n,propagate_s(nf,env,s,e->loc));
+			break;
+         */
+	 case &Pragma_e(_):
+			checked_set_output_effect(env,n,nf);
+			break;
+    case &StmtExp_e(s):
+		   //printf("\nSTMT EXP\n"); fflush(stdout);
+			let $(nf1,jmp) = propagate_s(nf,env,s,e->loc);
+			return_if_must_jump(n,jmp);
+			checked_set_output_effect(env,n,nf1);
+			break;
+    case &Tuple_e(le): fallthru(le);
+    case &Datatype_e(le,_,_): fallthru(le);
+    case &Primop_e(_,le):
+			let $(nf1,jmp) = propagate_list_e(nf,env,le,e->loc);
+			return_if_must_jump(n,jmp);
+			checked_set_output_effect(env,n,nf1);
+			break;
+	 case &Conditional_e(e1,e2,e3):
+			propagate_if_n_n_n_n(nf,env,enode(env,e1),
+										enode(env,e2),enode(env,e3),e->loc,n);
+			break;
+		/*
+		static void propagate_if_n_n_n_n(effect_t nf, env_t env, 
+								  node_t n1, node_t n2, node_t n3,seg_t loc,
+								  node_t ifn )
+
+			let $(f1,jmp1) = propagate_e(nf,env,e1,e->loc);
+			return_if_must_jump(n,jmp1);
+			let $(f2,jmp2) = propagate_e(f1,env,e2,e1->loc);
+			let $(f3,jmp3) = propagate_e(f1,env,e3,e1->loc);
+			switch($(jmp2,jmp3))
+			{
+			  case $(MustJump,MustJump):
+					return_if_must_jump(n,MustJump);
+					break;
+			  case $(MayJump,MayJump): // conservative approximation
+					checked_set_output_effect(env,n,f2);
+					checked_set_output_effect(env,n,f3);
+					break;
+				case $(MayJump,_):checked_set_output_effect(env,n,f2); break;
+				case $(_,MayJump):checked_set_output_effect(env,n,f3); break;
+				default: env_err("ioeffect_exp: impossible => Conditional_e");
+			}
+			break;
+		*/
+  case &Subscript_e(e1,e2): 
+			let $(f1,jmp1) = propagate_e_e(nf,env,e1,e2,e->loc);
+			return_if_must_jump(n,jmp1);
+			let $(f2,jmp2) = propagate_e_e(f1,env,e1,e2,e->loc);
+			return_if_must_jump(n,jmp2);
+			checked_set_output_effect(env,n,f2);
+			check_access(fenv,e1->loc,f2,e1->topt); // is region accessible ?
+			break;
+  	 case &And_e(e1,e2): 		 fallthru(e1,e2);
+	 case &Or_e(e1,e2): 			 
+				bool prev = must_have_constant_effect(env,true);
+				let $(_,jmp) = propagate_e_e(nf,env,e1,e2,e->loc);
+				if( jmp != MayJump ) must_have_constant_effect(env,prev);
+				return_if_must_jump(n,jmp);
+				checked_set_output_effect(env,n,nf);
+				must_have_constant_effect(env,prev);
+				break;
+    case &AssignOp_e(e1,_,e2): fallthru(e1,e2);
+    case &Swap_e(e1,e2):  fallthru(e1,e2);
+    case &SeqExp_e(e1,e2):
+			let $(f,jmp) = propagate_e_e(nf,env,e1,e2,e->loc);
+			return_if_must_jump(n,jmp);
+			checked_set_output_effect(env,n,f);
+			break;
+	 case &FnCall_e(e1,le,_,_,res):
+			#ifdef IOEFFECT_E_FNCALL_DBG
+			  printf("\n[%s] FnCall (input effect) : %s is %s\n",
+							 Position::string_of_segment(e->loc),
+		   				 Absynpp::exp2string(e),Absyn::effect2string(nf));
+			  fflush(stdout);
+			#endif
+			let env_effect_in = copy_effect(nf);
+			let $(f1,jmp1) = propagate_e(nf,env,e1,e->loc);
+			return_if_must_jump(n,jmp1);
+			let $(f2,jmp2) = propagate_list_e(f1,env,le,e1->loc);
+			*res = $(env_effect_in,NULL);
+			return_if_must_jump(n,jmp2);
+			let $(ftyp,noreturn) = check_fun_call_ptr(env,e1,false,e->loc);
+			let i = fn_type(ftyp); 
+			let out = join_env(e1->loc,f2,i.ieffect,i.oeffect,false);
+			*res = $(env_effect_in,copy_effect(out));
+			#ifdef  IOEFFECT_E_FNCALL_DBG
+			  printf("FnCall (output effect) : %s is %s\n",
+		   				 Absynpp::exp2string(e),Absyn::effect2string(out));
+			  fflush(stdout);
+			#endif
+			//if this function is noreturn then it behaves as if it 
+			//was a "return"
+			if( noreturn )
+			{
+				//let fenv = env->fenv;
+				//let nexit = get_stmt(fenv,exit_stmt(fenv));
+				//checked_set_output_effect(env,nexit,out);
+				return_if_must_jump(n,MustJump);
+			}
+			else checked_set_output_effect(env,n,out);
+			break;
+    case &AggrArrow_e(e1,_,_,_): fallthru(e1);
+    case &Deref_e(e1):
+			let $(f,jmp) = propagate_e(nf,env,e1,e->loc);
+			return_if_must_jump(n,jmp);
+			checked_set_output_effect(env,n,f);
+			check_access(fenv,e1->loc,f,e1->topt); // is region accessible ?
+			break;
+	 case &Throw_e(e1,_):
+			let $(f,jmp) = propagate_e(nf,env,e1,e->loc);
+			return_if_must_jump(n,jmp); //don't throw
+			add_jump_node(env,n);
+			propagate_succ(n,f);
+			return_if_must_jump(n,MustJump);
+			break;
+    case &Tagcheck_e(e1,_):fallthru(e1);
+	 case &Instantiate_e(e1,_): fallthru(e1);
+    case &Cast_e(_,e1,_,_): fallthru(e1);
+    case &Sizeofexp_e(e1): fallthru(e1);
+    case &Increment_e(e1,_): fallthru(e1);
+    case &NoInstantiate_e(e1): fallthru(e1);
+    case &AggrMember_e(e1,_,_,_): fallthru(e1);
+    case &Address_e(e1):
+			let $(f1,jmp1) = propagate_e(nf,env,e1,e->loc);
+			return_if_must_jump(n,jmp1);
+			checked_set_output_effect(env,n,f1);
+			break;
+    case &CompoundLit_e(_,lst): fallthru(lst);
+    case &Array_e(lst): fallthru(lst);
+    case &Aggregate_e(_,_,lst,_): fallthru(lst);
+    case &AnonStruct_e(_,lst):
+			let $(f,jmp) = propagate_listc_e(nf,env,lst,e->loc);
+			return_if_must_jump(n,jmp);
+			checked_set_output_effect(env,n,f);
+			break;
+    case &New_e(eopt,e1):
+			let loc = e->loc;
+			if( eopt != NULL )  //FIXME can this an xrgn ?
+			{
+				let $(f,jmp) = propagate_e(nf,env,eopt,loc);
+				return_if_must_jump(n,jmp);
+				loc = eopt->loc;
+				nf = f;
+			}
+			let $(f2,jmp2) = propagate_e(nf,env,e1,loc);
+			return_if_must_jump(n,jmp2);
+			checked_set_output_effect(env,n,f2);
+			if( eopt != NULL ) 
+				check_live(fenv,eopt->loc,f2,eopt->topt); // is region live
+			break;
+    case &Malloc_e(m):
+			let eopt = m.rgn;
+			let loc = e->loc;
+			 if( eopt != NULL ) //FIXME can this an xrgn ?
+			 {
+				 let $(f,jmp) = propagate_e(nf,env,eopt,loc);
+				 return_if_must_jump(n,jmp);
+				 nf = f;
+				 loc = eopt->loc;
+			 }
+			 let $(f2,jmp2) = propagate_e(nf,env,m.num_elts,loc);
+			 return_if_must_jump(n,jmp2);
+				 checked_set_output_effect(env,n,f2);
+			 if( eopt != NULL )
+				check_live(fenv,eopt->loc,f2,eopt->topt); // is region accessible ?
+			 break;
+    // {for i < e1 : t} -- used for variable-sized flat arrays
+     case &ComprehensionNoinit_e(e1,_,_): 
+			bool prev = must_have_constant_effect(env,true);
+			let $(f1,jmp1) = propagate_e(nf,env,e1,e->loc);
+			if( jmp1 != MayJump ) must_have_constant_effect(env,prev);
+			return_if_must_jump(n,jmp1);
+			checked_set_output_effect(env,n,nf);
+			must_have_constant_effect(env,prev);
+			break;
+	  case &Comprehension_e(_,e1,e2,_):  
+			bool prev = must_have_constant_effect(env,true);
+			let $(_,jmp1) = propagate_e_e(nf,env,e1,e2,e->loc);
+			if( jmp1 != MayJump ) must_have_constant_effect(env,prev);
+			return_if_must_jump(n,jmp1);
+			checked_set_output_effect(env,n,nf);
+			must_have_constant_effect(env,prev);
+			break;
+     case &UnresolvedMem_e(...): env_err("ioeffect_exp"); break;
+	}
+
+   RETURN: return;
+}
+//***********************************************************************
+#ifdef PRINT_SUCC_DBG
+void print_succ( node_t n , string_t msg )
+{
+	let iter = get_node_succ(n);
+	printf("\n---- Printing node_succ(%s) %p", msg, (unsigned int)iter  ); 
+	for ( ; iter != NULL ; iter = iter->tl ) 
+			{
+				let n1 = iter->hd;
+				switch(n1->n)
+				{
+					case &Stmt(s1):	
+						  printf("\n\nStatement (%p) : %s",
+									 (unsigned int)s1,Absynpp::stmt2string(s1));
+						  break;
+					default: continue;
+				}		
+			}
+			printf("\n----- End successor list\n");
+			fflush(stdout);	
+}
+#else 
+#define print_succ(a,b)  {}
+#endif
+
+//**********************************************************************
+
+static void ioeffect_stmt( env_t env , stmt_t s )
+{ 
+  let fenv = env->fenv;
+  let n = get_stmt(fenv,s); // node corresponding to this statement
+  let nf = get_input(n); // input effect of this statement
+  #ifdef IOEFFECT_STMT_DBG
+	  printf("\nInput effect for statement : %s is %s",
+				 Absynpp::stmt2string(s),Absyn::effect2string(nf));
+	  fflush(stdout);
+  #endif
+  switch(s->r)
+  {
+   case &Spawn_s(...): fallthru;
+   case &Cap_s(_):	
+         env_err("Unexpected case.");
+   case &Skip_s:	checked_set_output_effect(env,n,nf);break;
+	case &Break_s:  fallthru; //	print_succ(n,"Break_s");
+	case &Continue_s: fallthru; //print_succ(n,"Continue_s");
+	case &Goto_s(_): fallthru; // Function-scoped jumps
+	case &Fallthru_s(_,_): fallthru(NULL);
+	case &Return_s(e0):
+		  if( e0 != NULL )
+		  {
+			 let $(f,jmp) = propagate_e(nf,env,e0,s->loc);
+		  	 return_if_must_jump(n,jmp);
+			 nf = f;
+		  }
+		  add_jump_node(env,n);
+		  propagate_succ(n,nf);
+		  return_if_must_jump(n,MustJump);
+		  break;
+	case &Exp_s(e):
+			let $(f,jmp) = propagate_e(nf,env,e,s->loc);
+		   return_if_must_jump(n,jmp);
+			checked_set_output_effect(env,n,f);
+			break;
+	case &Seq_s(s1,s2):
+			let $(fs1,jmp1) = propagate_s(nf,env,s1,s->loc);
+		   return_if_must_jump(n,jmp1);
+			let $(fs2,jmp2) = propagate_s(fs1,env,s2,s->loc);
+		   return_if_must_jump(n,jmp2);
+			checked_set_output_effect(env,n,fs2);
+			break;
+  	case &IfThenElse_s(e,s1,s2):
+			propagate_if_n_n_n_n(nf,env,enode(env,e),
+										snode(env,s1),snode(env,s2),s->loc,n);
+			break;
+   case &While_s($(e,skip),s1): 
+			propagate_loop_e_e_s_e_s_n(nf,env,NULL,e,s1,NULL,skip,s->loc,n);
+			break;
+	// skip = successor_of(Continue), this is why we need it
+	case &For_s(e1,$(e2,_),$(e3,skip),s1):
+			propagate_loop_e_e_s_e_s_n(nf,env,e1,e2,s1,e3,skip,s->loc,n);
+			break;
+	case &Do_s(s1,$(e,skip)):
+			propagate_loop_e_e_s_e_s_n(nf,env,NULL,NULL,s1,e,skip,s->loc,n);
+			break;
+   case &TryCatch_s(s0,scs,_): 
+			let $(ns0f,jmp1) = propagate_s(nf,env,s0,s->loc);
+			nf = ns0f;
+			//Hmm... don't know if a "throw" is removed
+			// whether this is still a "Must jump" so
+			// we become safe and conservative
+			if( iter_jump_list(remove_throw,env,scs) ) jmp1 = MayJump;
+			if( jmp1 == MayJump)	 checked_set_output_effect(env,n,nf); 
+			bool all_jump = (scs != NULL);
+			// last pattern seems to be throwing an exception (always)
+			for(; scs!=NULL && scs->tl != NULL; scs=scs->tl)
+			{
+			    let sc = scs->hd;
+			    let wc = sc->where_clause;
+				 // where clause must not have effects
+			   /* if(wc != NULL)
+				 {
+					let $(tmp,_) = propagate_e_e(NULL,env,wc,wc,s0->loc);
+					nf = tmp;
+				 }*/
+				 // conservative approximation
+				 let $(outf,jmp) = propagate_s_noinput(NULL,env,sc->body,s0->loc);
+				 if( jmp == MayJump )
+				 {
+					 checked_set_output_effect(env,n,outf); //conservative
+					 all_jump = false;
+				 }
+				 if( iter_jump_list(remove_pattern_jump,env,NULL)) 
+					all_jump = false;
+   		}
+			if( all_jump == false) checked_set_output_effect(env,n,nf);
+ 			break;
+   case &Switch_s(e1,scs,_):
+			let $(f,jmp1) = propagate_e(nf,env,e1,s->loc);
+		   return_if_must_jump(n,jmp1);
+			for(; scs!=NULL; scs=scs->tl)
+			{
+			    let sc = scs->hd;
+			    let wc = sc->where_clause;
+				 let pat = sc->pattern;
+				 check_pat_access(fenv,pat,f,pat->loc);
+				 //check_access(pat->loc,f,pat->topt);
+				 /*switch(pat->r)
+				 {
+			      case &Pointer_p(p):
+						printf("\nHere! %s || %s\n",effect2string(f),
+									Absynpp::typ2string(pat->topt));
+						check_access(pat->loc,f,pat->topt);
+						break;
+					default: 
+							printf("\nNot here!\n");
+							break;
+			 	 }*/
+				  //where clause must not have effects
+			    if(wc != NULL)
+				 { let $(tmp,_) = propagate_e_e(f,env,wc,wc,e1->loc);
+					f = tmp;
+				 }
+				 // conservative approximation
+				 //FIXME: No control-flow sensitivity here 
+				 let $(outf,jmp2) = propagate_s(f,env,sc->body,e1->loc);
+	
+				 for( _ iter= jump_nodes(env) ; iter != NULL ; iter=iter->tl)
+				    switch(iter->hd){
+						case &Node(&Stmt(&{.r=&Break_s,...}),...): 
+							set_output_effect(n,get_input(iter->hd));
+							break;
+						default: break;
+					 }
+				  iter_jump_list(remove_pattern_jump,env,NULL);
+				// checked_set_output_effect(env,n,outf);
+   		}
+ 			break;
+	 case 	 &Decl_s(&Decl{.r=&Region_d(tv,_,eo),...},s1) 
+			 && 
+				  eo != NULL:
+		     
+			let xrgn = 	Absyn::is_xrgn_tvar(tv); 
+			let is_xopen = (tv->identity == -2);
+			let $(neof,jmp1) = propagate_e(nf,env,eo,s->loc);
+		   return_if_must_jump(n,jmp1);
+			let eff;
+			let rgn = void_type; // dummy value
+			bool is_aliased = true;
+			if(  xrgn ){
+			  eff = check_parent_add_child(new VarType(tv),
+														 Tcutil::compress(safe_cast
+														 (eo->topt,"ioeffect_stmt")),
+														neof,s->loc);
+			}
+			else if ( is_xopen ){
+				type_t typ =  safe_cast(eo->topt,"xopen ioeffect");
+				//check_access(s->loc,neof,typ); // must be accessible prior to
+																// conversion
+				switch(typ){
+					case &AppType(&RgnHandleCon,&List(r,_)): rgn = r; break;
+					default: Warn::impos("IOEffect::? xopen"); 
+				}
+				let iter;
+				//printf("\nRegion: %s effect = %s\n",
+				//				Absynpp::typ2string(rgn),
+				//				effect2string(neof) );fflush(stdout);
+				let r = safe_cast(Absyn::find_rgneffect(type2tvar(rgn),neof),
+																		"ioeffect xopen");
+				let $(n1,n2,alias) = caps2tup(rgneffect_caps(r));
+				is_aliased = alias;
+				if(n2 < 1 ){
+					Tcutil::terr(s->loc,"Region %s has no lock capabilities but `xopen' requires at least one lock capability.",Absynpp::typ2string(rgneffect_name(r)));
+				} else {
+					// reserve a lock capability for this region
+					updatecaps_rgneffect(r,tup2caps(n1,n2-1,true));
+				}
+					//if( region_accessible( Absyn::type_t r, effect_t e  )
+				eff = neof; //FIXME
+			}
+		   else	 eff = neof;
+
+			let $(neof1,jmp2) = propagate_s(eff,env,s1,eo->loc);
+			neof = neof1;
+			if( neof == &empty_effect) neof = NULL;
+			if( xrgn &&  find_rgneffect(tv,neof) != NULL )
+			{
+			 Tcutil::terr(s->loc,"Region is not freed by the end of its scope.");
+			} else if( is_xopen ){
+				let r = Absyn::find_rgneffect(type2tvar(rgn),neof);
+				if( r == NULL ){
+						Tcutil::terr(s->loc,"Region %s was aliased here (`xopen') but also freed within the scope of `xopen'.",Absynpp::typ2string(rgn));
+				} else { // restore lock count
+						let $(n1,n2,alias) = caps2tup(rgneffect_caps(r));
+						updatecaps_rgneffect(r,tup2caps(n1,n2+1,is_aliased));
+				}
+			}
+		   //FIXME: Hmmm ... ?  we mark this block as MustJump
+			//  when necessary *AFTER* we the output effect is set
+			checked_set_output_effect(env,n,neof);
+			return_if_must_jump(n,jmp2);
+			break;
+	 case &Decl_s(&Decl{.r=&Let_d(pat,_,e1,_),...},s11):
+		   let $(nf1,jmp1) = propagate_e(nf,env,e1,s->loc);
+			return_if_must_jump(n,jmp1);
+			check_pat_access(fenv,pat,nf1,pat->loc);
+			//check_access(pat->loc,nf1,pat->topt);
+		   let $(nf2,jmp2) = propagate_s(nf1,env,s11,s->loc);
+		   /*	printf("\n[%s] Input effect : %s Output effect : %s\n",
+						Position::string_of_segment(s->loc),
+						effect2string(nf1),
+						effect2string(nf2));*/
+			return_if_must_jump(n,jmp2);
+			checked_set_output_effect(env,n,nf2);
+			break;
+
+	 case &Decl_s(&Decl{.r=&Var_d(vdecl),...},s11):
+			let e0 =  vdecl->initializer;
+			/*printf("\n[%s]Input effect of decl: %s || out = %s\n",
+							Position::string_of_segment(s->loc),
+							effect2string(nf),
+						   effect2string(get_output(n))	); fflush(stdout);*/
+
+			if( e0 != NULL )
+			{
+				let $(nf1,jmp1) = propagate_e(nf,env,e0,s->loc);
+				nf = nf1;
+				return_if_must_jump(n,jmp1);
+			}
+				/*printf("\n[%s] Before stmt check: effect of decl: %s\n",
+							Position::string_of_segment(s->loc),
+							effect2string(nf)); fflush(stdout);*/
+
+			let $(nf2,jmp2) = propagate_s(nf,env,s11,s->loc);
+			nf = nf2;
+				/*printf("\n[%s] After stmt check: effect of decl: %s\n",
+							Position::string_of_segment(s->loc),
+							effect2string(nf2)); fflush(stdout);*/
+
+
+			return_if_must_jump(n,jmp2);
+				/*printf("\n[%s]Output effect of decl: %s\n",
+							Position::string_of_segment(s->loc),
+							effect2string(nf)); fflush(stdout);*/
+		   checked_set_output_effect(env,n,nf);
+			break;
+   case &Decl_s(&Decl{.r=&Fn_d(fd),...},s1):
+			analyze_fd(env->tables,fd,s->loc); 
+			fallthru(s1);
+   case &Decl_s(_,s1):
+			fallthru(s1);
+			break;
+	case &Label_s(_,s1):
+			let $(ns0f,jmp1) = propagate_s(nf,env,s1,s->loc);
+		   return_if_must_jump(n,jmp1);
+		   checked_set_output_effect(env,n,ns0f);
+			break;
+  }
+  RETURN: // post-processing done here
+  //remove a goto that jumps to a label within the scope of s
+  // the goto is also contained within the scope of s
+  iter_jump_list(remove_gotos,env,s); 
+}
+////////////////////////////////////////////////////
+bool check_contains_xrgn_e( bool @`r b, exp_t e )
+{
+   return true;
+}
+
+bool check_contains_xrgn_s( bool @`r b, stmt_t s )
+{
+	switch(s->r)
+	{
+		 case  &Decl_s(&Decl{.r=&Region_d(tv,_,eo),...},_) 
+			 &&  eo != NULL:
+			  if(	Absyn::is_xrgn_tvar(tv) )
+			  {
+						*b = true;
+						return false;
+			  }
+			  return true;
+		 default: return true;
+	}	     
+}
+
+bool contains_xrgn( stmt_t s )
+{
+	bool ret = false;
+	visit_stmt(check_contains_xrgn_e,check_contains_xrgn_s,&ret,s);
+	return ret;
+}
+
+////////////////////////////////////////////////////
+static void analyze_fd( JumpAnalysis::jump_anal_res_t
+								tables,
+							   fndecl_t fd,
+								Position::seg_t loc
+							 )
+{
+ //skip this analysis for most functions
+/* if( (fd->i.ieffect == NULL && contains_xrgn(fd->body) == false) &&
+	   (fd->i.throws == NULL  ||  is_throwsany(fd->i.throws) ) 		
+	) return;*/
+
+ let s = fd->body;
+ let skip = skip_stmt(s->loc); // dummy exit block
+
+  // insert dummy exit block after the function body
+  stmt_t s0 =  new_stmt(new Seq_s(new_stmt(s->r,s->loc), skip), s->loc);
+  // construct a new environment
+  env_t env = new_env(tables,new_fenv(fd,loc,skip)); 
+  //add regions specified in function's input effect to the current effect
+
+  //FIXME: fix env structure
+  //let iter = fd->i.ieffect;
+  //for( ; iter != NULL ; iter = iter->tl )  add_xrgn(env,iter->hd->name);
+
+  //begin throws scope
+  push_throws_scope(env);
+  if(  get_debug()  )
+		fprintf(stderr,"\nIOEffect analysis:");
+
+	if(  get_debug()  )
+		fprintf(stderr,"\nIOEffect: Function declaration (%s) %s : %s",
+  					Position::string_of_loc(loc),
+					*(*fd->name)[1],
+					"");
+	
+	let ieff = fd->i.ieffect;
+	let oeff  = fd->i.oeffect;
+	if( get_debug() )
+	{
+		let cyc_eff = fd->i.effect;
+		if( cyc_eff != NULL )
+			fprintf(stderr,"\nTraditional effect: %s", Absynpp::typ2string(cyc_eff));
+		if( ieff != NULL)
+			fprintf(stderr,"\nInput effect: %s", effect2string(ieff));
+		if( oeff != NULL)
+			fprintf(stderr,"\nOutput effect: %s", effect2string(oeff));
+		fprintf(stderr,"\n");
+		fflush(stderr);
+	}
+	
+   let ns = get_stmt(env->fenv,s0);
+   let nskip = get_stmt(env->fenv,skip);
+   // set input and output effect for the function body
+	// set the input and output effect for dummy exit block
+	set_input_effect(ns,ieff,s0->loc);
+	if( oeff != NULL )
+	{
+		set_output_effect(ns,oeff);
+   	set_input_effect(nskip,oeff,s->loc);
+		set_output_effect(nskip,oeff);
+	}
+	else
+	{
+		set_output_effect(ns,&empty_effect);
+   	set_input_effect(nskip,&empty_effect,s->loc);
+		set_output_effect(nskip,&empty_effect);
+	}
+
+	if(  get_debug()  )
+		fprintf(stderr,"\nIOEffect pass: Exception Analysis");
+	// exception analysis
+   // construct flow graph
+	set_ignore_xrgn(env->fenv,true); //ignore x-region accessed for the duration	
+												// of the exception analysis
+   visit_stmt_pop(throws_exp_push,throws_exp_pop,
+					  throws_stmt_push,throws_stmt_pop,env,s0);
+
+   if(  get_debug()  )
+		fprintf(stderr,"\nIOEffect pass: Effect Analysis");
+	// propagate effects within the flow graph
+	// check that the body checks with the specified I/O effect
+	if( (fd->i.ieffect != NULL || contains_xrgn(fd->body) ) ){
+	  set_ignore_xrgn(env->fenv,false);
+	  ioeffect_stmt(env,s0);
+	}
+
+   if(  get_debug()  )
+		fprintf(stderr,"\nIOEffect: DONE");
+  //Absynpp::typ2string(fd->cached_type));
+  //  let skip = skip_stmt(fd->body->loc);
+  //let st =  new_stmt(new Seq_s( fd->body, skip),fd->body->loc);
+  //   stmt(env,s0);
+  //end throws scope
+  pop_throws_scope(env,get_stmt(env->fenv,s0));
+   if(  get_debug()  )	fprintf(stderr,"\n");
+  Warn::flush_warnings();
+}
+
+//////////////////////////////////////////////////////
+void analysis(JumpAnalysis::jump_anal_res_t tables, 
+					list_t<Absyn::decl_t,`H> tds)
+{
+  Toc::init_toc_state();
+  let lst = NULL;
+//  printf("\nInit_toc_state\n");
+  for(; tds != NULL; tds = tds->tl)
+    switch (tds->hd->r) 
+	 {
+    case &Let_d(...):
+    case &Letv_d(...):
+    case &Region_d(...):
+    case &Var_d(...):
+    case &Typedef_d(...):
+    case &Aggr_d(...):
+    case &Datatype_d(...):
+    case &Enum_d(...):
+    case &Porton_d:
+    case &Portoff_d:
+    case &Tempeston_d:
+    case &Tempestoff_d:
+    case &ExternC_d(...):
+    case &ExternCinclude_d(...): continue;
+    case &Namespace_d(_,tds2): fallthru(tds2);
+    case &Using_d(_,tds2): analysis(tables,tds2); break;
+    case &Fn_d(fd): //if( fd->i.ieffect != NULL || fd->i.throws != NULL ) 
+	 	analyze_fd(tables,fd,tds->hd->loc); break;
+    }
+//   Toc::finish();
+}
+////////////////////////////////////////////////
+////////////////////////////////////////////////
+///////////////////////////////////////////////
+////// Main logic /////////////////////////////
+///////////////////////////////////////////////
+
+// is bool = true => found
+static $(rgneffect_opt_t,bool) find_effect_extended( Absyn::type_t r, effect_t e )
+{
+  r = Tcutil::compress(r);
+  if( is_heaprgn(r)   ) return $(NULL,true);
+  else if( Absyn::is_xrgn(r) == false ) //sanity check
+  {
+	 env_err(aprintf("IOEffect::find_effect_extended Not xrgn : %s (kind =%s)"
+						,Absynpp::typ2string(r),
+						 Absynpp::kindbound2string(type2tvar(r)->kind)));
+  }
+  let z =  find_effect(r,e);
+  return ( z == NULL )?$(NULL,false):$(z,true);
+}
+// checks both "liveness" and "accessibility" of a region in effect "e"
+// returns a binary tuple whose first elt is "live" and snd "accessible"
+static $(bool,bool) region_accessible_common( Absyn::type_t r,effect_t e)
+{
+  let $(z,b) = find_effect_extended(r,e);
+  // this says that stuff on the Heap is inaccessible ...
+  // we don't want global locks, do we ?
+  if( !b || z == NULL ) return $(b && z == NULL,false); 
+  let $(n1,n2,_) = Absyn::caps2tup(rgneffect_caps(z));
+  if( n1 < 1 ) env_err("IOEffect::region_live_common: impossible");
+  let p = Absyn::rgneffect_parent(z);
+  if( p == NULL ) return $(true,n2 > 0);// empty parent => abstracted
+  if( rgn_cmp(Absyn::rgneffect_name(z),p)  ){
+		//printf("\nFound cyclic instantiation !\n");
+		Tcutil::terr(0,"Found cycle within instantiated effect. If it is a spawn operation try explicit instantiation");
+		return $(false,false);
+  }
+//	printf("\nregion_accessible_common checking parent : %s\n",Absynpp::typ2string(p)); 
+//	fflush(stdout);
+  let $(a,b) = region_accessible_common(p,e);
+  return $(a, a && (b || n2 > 0 ));
+}
+static bool region_live( Absyn::type_t r,effect_t e)
+{  return ({
+				#ifdef REGION_LIVE_DBG
+				printf("\nRegion  effect being checked %s.\n",
+							Absyn::effect2string(e)); fflush(stdout) ;
+			  #endif
+				 let $(a,_) = region_accessible_common(r,e);
+			  #ifdef REGION_LIVE_DBG
+				printf("\nRegion %s is live = %d\n\n",
+							Absynpp::typ2string(r),a); fflush(stdout) ;
+			  #endif
+				 a; }); 
+}
+static bool region_accessible( Absyn::type_t r, effect_t e  )
+{ return ({let $(a,b) = region_accessible_common(r,e);
+			  #ifdef REGION_ACCESSIBLE_DBG
+				printf("\nRegion %s is live = %d accessible = %d\n",
+							Absynpp::typ2string(r),a,b); fflush(stdout) ;
+			  #endif
+			  a && b; });
+}
+////////////////////////////////////////////////////
+static rgneffect_opt_t join_env_local( 
+										  Position::seg_t loc,
+										  rgneffect_t  r1,
+										  rgneffect_opt_t  r2,
+										  rgneffect_t  r3
+								 		);
+
+static rgneffect_opt_t join_env_spawn( 
+										  Position::seg_t loc,
+										  rgneffect_t  r1,
+										  rgneffect_opt_t  r2,
+										  rgneffect_t  r3
+								 		);
+
+	 effect_t	summarize_all( Position::seg_t loc,
+											effect_t  f 
+										 );
+
+static $(effect_t,effect_t) split( Position::seg_t loc,
+											  geffect_t<`r> dom, 
+											  effect_t f,
+											  bool strict);
+////////////////////////////////////////////////////////
+static Absyn::tvar_t get_tvar( Absyn::type_t t , Position::seg_t loc)
+{
+   switch(t)
+   {
+	  case &VarType(tv): return tv;
+	  case &Evar(_,z,_,_):
+			 if( z == NULL ){ Tcutil::terr(loc,"Found a non-unified xregion variable \"%s\" (if it is spawn try using explicit instantiation).",Absynpp::typ2string(t));
+				return Tcutil::new_tvar(Tcutil::kind_to_bound(&Tcutil::xrk));
+			 }
+			 else return get_tvar(safe_cast(z,"get_tvar"),loc);
+	  default: env_err(aprintf("IOEffect::get_tvar %s",Absynpp::typ2string(t)));
+	}
+}
+
+static bool exists_in(  effect_t f, type_t t  )
+{
+  return  is_heaprgn(t) ||
+			 ( Absyn::find_rgneffect(type2tvar(t),f) != NULL);
+}
+
+static bool not_exists_in( effect_t f, type_t t )
+{
+  return ( !is_heaprgn(t) ) &&
+ 			 Absyn::find_rgneffect(type2tvar(t),f) == NULL;
+}
+
+// track abstracted parents
+static types_t abstracted_parents( effect_t env , effect_t in )
+{
+  types_t ret = NULL;
+  let p,r;
+  for( ; in != NULL ; in=in->tl)
+  {
+	 p = Absyn::rgneffect_parent(in->hd);
+	 if( p == NULL ) //maybe parent has been abstracted, search in env
+	 {
+		  r = Absyn::find_rgneffect(
+							type2tvar(Absyn::rgneffect_name(in->hd)),env);
+		 if( r == NULL) continue;
+		 let p =  Absyn::rgneffect_parent(r);
+		 if( p != NULL ) // don't care about NULL not our concern here
+			ret = new List(p,ret);
+	 }
+  }
+  return ret;
+}
+//check that all regions are live in effect f 
+// FIXME: Inefficient
+static bool all_live( effect_t f ,Position::seg_t loc, string_t errmsg )
+{
+  let iter = f;
+  bool ret = true;
+  for( ; iter != NULL ; iter = iter->tl )
+  {
+	  if(!region_live(Absyn::rgneffect_name(iter->hd),f))
+	  {
+		 Tcutil::terr(loc,"%s => Region %s is not live  in effect %s",
+						  errmsg,
+						  Absynpp::typ2string(Absyn::rgneffect_name(iter->hd)),
+						  effect2string(f));
+		 ret = false;
+	  }
+  }
+  return ret;
+}
+
+// all names in list t must be live in effect f
+static bool all_live_list( types_t t, effect_t f ,Position::seg_t loc, string_t errmsg )
+{
+  let iter = t;
+  bool ret = true;
+  for( ; iter != NULL ; iter = iter->tl )
+  {
+	  if(!region_live(iter->hd,f))
+	  {
+		 Tcutil::terr(loc,"%s => Region %s is not live  in effect %s",
+						  errmsg,
+						  Absynpp::typ2string(iter->hd),
+						  effect2string(f));
+		 ret = false;
+	  }
+  }
+  return ret;
+}
+
+// filter live effects
+static effect_t live( effect_t in )
+{
+  let iter = in;
+  let ret = NULL;
+  #ifdef LIVE_FILTERING_DBG
+  printf("\nfiltering live regions input = %s", effect2string(in));
+  fflush(stdout);
+  #endif
+  for( ; iter != NULL ; iter = iter->tl )
+  {
+	  #ifdef LIVE_FILTERING_DBG
+		  printf("\nChecking whether region %s is accessible",
+					Absynpp::typ2string(Absyn::rgneffect_name(iter->hd))); 
+  	  #endif
+	  if(region_live(Absyn::rgneffect_name(iter->hd),in))
+		  ret = new List(iter->hd,ret);
+  }
+  #ifdef LIVE_FILTERING_DBG
+  printf("\nfiltering live regions output = %s\n", effect2string(ret));
+  fflush(stdout);
+  #endif
+  return ret;
+}
+
+//////////////////////////////////////////////////////////
+// @ env = Environment input effect
+// @ in  = Function input effect 
+// @ out = Function output effect
+static effect_t join_env( Position::seg_t loc,
+								  effect_t env , 
+								  effect_t in,
+								  effect_t out,
+								  bool	  sp
+								)
+{
+  if( env == &empty_effect) env = NULL;
+  if( in == &empty_effect) in = NULL;
+  if( out == &empty_effect) out = NULL;
+  let sin = summarize_all(loc,in); // obtain summarized input
+  if(!all_live(sin,loc,"Input effect")) return NULL; //don't go on
+  //  printf("\nMust live : %s\n", list2string(must_live,Absynpp::typ2string));
+  //printf("\nSummarized input effect : %s\n",effect2string(sin));
+  let sout = summarize_all(loc,out);	// obtain summarized output effect 
+
+  #ifdef IOEFFECT_JOIN_DBG
+		printf("\n[%s] Join effects: (thread? %s)\nEnvironment Input: %s\nFunction Input: %s\nFunction Output:%s\n",
+					Position::string_of_segment(loc),sp?"yes":"no",
+					effect2string(env),
+					effect2string(sin),
+					effect2string(sout)); fflush(stdout);
+  #endif
+
+  if(!all_live(sout,loc,"Output effect")) return NULL; //don't go on
+  let $(in1,kept_by_env) = split(loc,sin,env,true); //env
+  let fun = sp?join_env_spawn:join_env_local;
+  let outenv = NULL;
+  let abs_par = abstracted_parents(env,sin);
+  //deduce the environment output effect
+  for( ; sin != NULL ; sin = sin->tl )
+  {
+	 let tv = get_tvar(sin->hd->name,loc);
+	 let r_out = fun(loc,sin->hd, // summarized function input
+							Absyn::find_rgneffect(tv,sout), // summarized function output
+							safe_cast(Absyn::find_rgneffect // environment effect
+									(tv,in1),"join_env")	 );
+	 if( r_out == NULL ) continue;
+	 outenv = new List(safe_cast(r_out,"join_env") ,  outenv	);
+  }
+  outenv =  live(List::append(outenv,kept_by_env));
+  if(!all_live_list(abs_par,outenv,loc,"Abstracted parent not live"))
+	return NULL;
+  return outenv;
+}
+//////////////////////////////////////////////////////////////////////
+// split f so that regions dom(dom) are in the $first and the remaining
+// the $second elt of the ret val
+static $(effect_t,effect_t) split( Position::seg_t loc,
+											  geffect_t<`r> dom, 
+											  effect_t f,bool strict )
+{
+  int len,len1;
+  if( dom == NULL ) return $(NULL,copy_effect(f));
+  else if( (len=List::length(dom)) > List::length(f) )
+  {
+	 Tcutil::terr(loc,"Function accepts more regions than the regions available in the calling context. Function = %s , Calling context = %s",
+						effect2string(dom),effect2string(f)
+					 );
+	 return $(NULL,NULL);
+  } 
+
+  effect_t first = NULL, second = NULL;
+  let r = NULL;
+  let cp = NULL;
+  let ftmp =f;
+  for(len1=0 ; f != NULL ;  f = f->tl )
+  {
+	 let tv=get_tvar(f->hd->name,loc);
+	 r = find_rgneffect(tv,dom);
+//	 printf("\nSPLIT: Find %s in dom = %s found = %d\n", 
+//					Absynpp::tvar2string(tv),
+//					effect2string(dom), r!= NULL );
+	 cp = copyeffelt(f->hd);	
+	 if( r != NULL )
+	 { first = new List(cp,first); len1++; }
+	 else second = new List(cp,second);
+  }
+
+  if( strict && len != len1 ) 
+  {
+	 Tcutil::terr
+	 (loc,"Function accepts more regions than the regions available in the calling context. Function = %s , Calling context = %s",
+						effect2string(dom),effect2string(ftmp)
+					 );
+	 return $(NULL,NULL);
+  }
+  return $(first,second);
+}
+//////////////////////////////////////////////////////////////////
+////////////// Summarization Stuff//////////////////////////////
+static void check_positive( Position::seg_t loc,cap_t  c )
+{
+  if( is_nat_cap(c) && get_nat_cap(c) < 1 )
+	 Tcutil::terr(loc,"Found a non-positive capability. Only positive capabilities can be passed.");
+}
+
+//assumes aliasable
+static rgneffect_t 
+						 join_rgneffect(  Position::seg_t loc,
+												rgneffect_t r1, 
+												rgneffect_t r2
+											)
+{
+  let $(rg_r1,lk_r1,alias_r1) = Absyn::caps2tup(Absyn::rgneffect_caps(r1));
+  let $(rg_r2,lk_r2,alias_r2) = Absyn::caps2tup(Absyn::rgneffect_caps(r2));
+
+  if( !alias_r1 || !alias_r2)
+  {
+		 Tcutil::terr(loc,"Cannot join capabilties of region effects %s and %s. Both need to be *impure*",
+								rgneffect2string(r1),
+								rgneffect2string(r2));
+		return r1;
+  }
+  return	Absyn::new_rgneffect(Absyn::rgneffect_name(r1),
+										Absyn::tup2caps(rg_r1+rg_r2,lk_r1+lk_r2,true),
+										Absyn::rgneffect_parent(r1)
+				 					  );
+}
+
+static bool not_aliasable( Absyn::rgneffect_t r )
+{
+  return !Absyn::is_aliasable_rgneffect(r);
+}
+/// requires: dom(f) = {r}
+// summarizes rgneffects to a single rngeffect
+
+static rgneffect_t  summarize(Position::seg_t loc, effect_t  f )
+{
+  if( f == NULL ) 	env_err("IOEffect::summarize");
+  let ret = copyeffelt(f->hd);
+  for( f = f->tl ; f != NULL ; f = f->tl )
+		ret = join_rgneffect(loc,ret,f->hd);
+  return ret;
+}
+
+// Returns a summarized list of effects 
+effect_t summarize_all(Position::seg_t loc,effect_t  f)
+{
+  effect_t  ret = NULL;
+  while( f != NULL )
+  {
+	  let dummy = List(f->hd,NULL);
+		//	  printf("\nSUMMARIZE_ALL: f= %s , criterion= %s",
+		//				effect2string(f),rgneffect2string(f->hd));
+	  let $(dom,rest) = split(loc,&dummy,f,false);
+	  let r = summarize(loc,dom);
+	  #ifdef SUMMARIZE_DBG
+		  	printf("\n@Summarize %s   effect : %s ret =%s\n",
+				Absynpp::typ2string(f->hd->name),effect2string(dom),
+				rgneffect2string(r));
+			fflush(stdout);
+		#endif
+	   ret = new List(r , ret);
+	   f = rest;
+  }
+  //	printf("\nSummarize_all : pars : %s" , list2string(pars,Absynpp::typ2string));
+  return ret; //$(ret,pars);
+}
+///////////////////////////////////////////////////////////////////
+///////////////// Deduce Output Effect ///////////////////////////
+///////////////////////////////////////////////////////////////////
+
+static caps_t  output_caps(  Position::seg_t loc,
+									   rgneffect_t  r1,
+										rgneffect_t  r2,
+									   rgneffect_t  r3
+									);
+
+static	Absyn::rgneffect_t 
+	guess_out_cap( Position::seg_t loc,
+						Absyn::rgneffect_t  r1, 
+						Absyn::rgneffect_opt_t  r2 
+					 )
+{
+	if( r2 != NULL ) return r2;
+
+	return Absyn::new_rgneffect(
+					Absyn::rgneffect_name(r1),
+					Absyn::tup2caps(0,0,Absyn::is_aliasable_rgneffect(r1)),
+					Absyn::rgneffect_parent(r1)
+				 					  );
+}
+
+// env output = f(input , output , env innput)
+static rgneffect_opt_t join_env_local( 
+										  Position::seg_t loc,
+										  rgneffect_t  r1,
+										  rgneffect_opt_t  r2,
+										  rgneffect_t  env
+								 		)
+{
+  let r1p = Absyn::rgneffect_parent(r1);	
+  let envp = Absyn::rgneffect_parent(env);	
+  //if the function accepts an effect with a specific parent
+  // then the environment must provide this parent or fail...
+  if( r1p != NULL && ( envp == NULL || !rgn_cmp(r1p,envp)))
+  {
+	 if( get_debug() )
+		 Tcutil::terr(loc,"Cannot convert %s to %s (rp1!=NULL = %d envp == NULL = %d rgn_cmp(r1p,envp) = %d r1p= %s envp = %s).",
+							rgneffect2string(env), rgneffect2string(r1),r1p!=NULL,envp==NULL,!rgn_cmp(r1p,envp),Absynpp::typ2string(r1p), envp!=NULL?Absynpp::typ2string(envp):(string_t)"<null>" );
+	 else 
+		 Tcutil::terr(loc,"Cannot convert %s to %s.",
+							rgneffect2string(env), rgneffect2string(r1));
+	 return NULL;
+  }
+  #ifdef IOEFFECT_JOIN_DBG
+		printf("\n[%s] Join Local effects: \nEnvironment Input: %s\nFunction Input: %s\nFunction Output:%s\n",
+					Position::string_of_segment(loc),
+					env!=NULL?rgneffect2string(env):(string_t)"nil",
+					r1!=NULL?rgneffect2string(r1):(string_t)"nil",
+					r2!=NULL?rgneffect2string(r2):(string_t)"nil"); fflush(stdout);
+  #endif
+
+
+  check_positive(loc,Absyn::rgn_cap(Absyn::rgneffect_caps(r1)));
+  let caps = output_caps(loc,r1,guess_out_cap(loc,r1,r2),env);
+  if( Absyn::get_nat_cap(Absyn::rgn_cap(caps)) == 0) return NULL;
+  return Absyn::new_rgneffect(Absyn::rgneffect_name(r1),caps,envp);
+}
+
+static rgneffect_opt_t  join_env_spawn( 
+										  Position::seg_t loc,
+										  rgneffect_t  r1,
+										  rgneffect_opt_t  r2,
+										  rgneffect_t  r3
+								 		)
+{
+	if( r2 != NULL )
+	{
+		Tcutil::terr(loc,"Spawn should consume region effect %s but it appears on the output effect %s",
+							rgneffect2string(r1),rgneffect2string(r2));
+		return NULL;
+   }
+	let $(rg,lk,aliased) = Absyn::caps2tup(Absyn::rgneffect_caps(r1)); 
+	if( aliased && lk > 0 )
+	{
+			Tcutil::terr(loc,"Invalid lock capability in region input effect  %s: Cannot pass a positive impure lock to spawn",
+							rgneffect2string(r1));
+			return NULL;
+	}
+   if( Absyn::rgneffect_parent(r1) == NULL || 
+		 Absyn::rgneffect_parent(r3) == NULL 
+     )
+	{
+			Tcutil::terr(loc,"Cannot pass to spawn effects having abstracted parents (thread=%s) (enviroment=%s)", 
+			rgneffect2string(r1),rgneffect2string(r3)	);
+		 return NULL;
+	}
+	/*
+	if( is_star_cap(rg) || is_star_cap(rg) )
+	{
+		Tcutil::terr(loc,"Star does not allow region effects with `star capabilities but found in @ieffect %s.",
+							rgneffect2string(r1));
+		return NULL;
+	}
+	else
+	if( !is_bot_cap(lk) && !is_nat_nobar_cap(lk) )
+   {
+		Tcutil::terr(loc,"Invalid lock capability in region input effect  %s.",
+							rgneffect2string(r1));
+		return NULL;
+	}	 
+	*/
+   else {
+		let ret =  join_env_local(loc,r1,r2,r3);
+		if( !aliased && lk > 0 && ret != NULL ){
+			let $(_,lk_out,_) = Absyn::caps2tup(Absyn::rgneffect_caps(ret)); 
+			if( lk_out == 0 ) return ret;
+			Tcutil::terr(loc,"Invalid lock capability in region input effect  %s: Cannot pass a positive pure lock to spawn and retain the effect %s to this thread.",
+							rgneffect2string(r1),rgneffect2string(ret));
+			return NULL;
+	   }
+		return ret;
+	}	
+}
+///////////////////////////////////////////////////////////////////////
+static caps_t  output_caps(  Position::seg_t loc,
+									   rgneffect_t  r1, //fun input
+										rgneffect_t  r2, // fun output
+									   rgneffect_t  r3 // environment
+									)
+{
+	let $(in_rg,in_lk,alias_in) = 
+		Absyn::caps2tup(Absyn::rgneffect_caps(r1));
+	let $(out_rg,out_lk,alias_out) = 
+		Absyn::caps2tup(Absyn::rgneffect_caps(r2));
+	let $(env_rg,env_lk,alias_env) = 
+		Absyn::caps2tup(Absyn::rgneffect_caps(r3));
+	let ret_rg = 0;
+	let ret_lk = 0;
+
+	if( (alias_in && !alias_out) || (!alias_in && alias_out) )
+	{
+		 Tcutil::terr(loc,"No output capability for input = %s output = %s env = %s: Input and output should be *both* pure/impure",
+								rgneffect2string(r1),rgneffect2string(r2),
+								rgneffect2string(r3) );
+	}
+	else if( (alias_env && !alias_in)  )
+	{
+		 Tcutil::terr(loc,"No output capability for input = %s output = %s env = %s: Cannot convert the enviroment impure effect to a pure one",
+								rgneffect2string(r1),rgneffect2string(r2),
+								rgneffect2string(r3) );
+	}
+	else
+	{
+	  if( env_rg < in_rg ){
+		 Tcutil::terr(loc,"Function requires more region capabilities (%s) than the current region capabilities (%s)",
+									rgneffect2string(r1),rgneffect2string(r3));
+		}
+		ret_rg = env_rg+out_rg-in_rg; 
+		if( ret_rg < 0 )
+		{
+			 Tcutil::terr(loc,"No output (region) capability for input = %s output = %s env = %s: Negative output (region) capability : %d",
+									rgneffect2string(r1),rgneffect2string(r2),
+									rgneffect2string(r3),ret_rg );
+			 ret_rg = 0;
+		}
+	   if( env_lk < in_lk ){
+		 Tcutil::terr(loc,"Function requires more lock capabilities (%s) than the current lock capabilities (%s)",
+									rgneffect2string(r1),rgneffect2string(r3));
+		}
+		ret_lk = env_lk+out_lk-in_lk;
+		if( ret_lk < 0 )
+		{
+			 Tcutil::terr(loc,"No output (lock) capability for input = %s output = %s env = %s: Negative output (lock) capability : %d",
+								rgneffect2string(r1),rgneffect2string(r2),
+								rgneffect2string(r3),ret_lk );
+			 ret_lk = 0;
+		}
+	}
+	return Absyn::tup2caps(ret_rg,ret_lk,alias_env);
+}
+
+
+
+/*
+t = tcFnCall(te,loc,topt,e1,es,vci,&alias_arg_exps);
+type_t t = compress((type_t)e1->topt);
+switch (t) {
+    case &PointerType(PtrInfo(t1,tq,PtrAtts(rgn,x,b,zt,_))):
+      // Note: rgn is irrelevant -- all code is in the heap.
+      // Nonetheless, perhaps we cast to another region, so check
+      // the capability just for fun.
+      check_rgn_accessible(te,loc,rgn);
+-----------------------------------------
+tcDeref e
+type_t t = compress((type_t)e->topt);
+    switch (t) {
+case &PointerType(PtrInfo(t2,_,PtrAtts(rt,_,b,zt,_))):
+      check_rgn_accessible(te,loc,rt);
+------------------------------------------------------------------
+ype_t tcSubscript(tenv_t te_orig, seg_t loc, type_t * topt,
+             exp_t e1, exp_t e2) {
+ type_t t1 = compress((type_t)e1->topt);
+ switch (t1) {
+    case &PointerType(PtrInfo(t,tq,PtrAtts(rt,_,b,zt,_))):
+check_rgn_accessible(te,loc,rt);
+----------------------------------------------------------------
+type_t tcMalloc(tenv_t te, seg_t loc, type_t * topt, exp_opt_t @ropt,
+                         type_t *@t, exp_t @e, bool @is_calloc, bool @is_fat) {
+type_t rgn = heap_rgn_type;
+    if (*ropt != NULL) {
+      // check that the region handle is still valid
+      // JGMFIX: should just unify here...
+      type_t expected_type =
+        rgn_handle_type(new_evar(&trko,lookup_opt_type_vars(te)));
+      type_t handle_type = tcExp(te,&expected_type,(exp_t)*ropt);
+      switch (compress(handle_type)) {
+      case &AppType(&RgnHandleCon,&List{r,_}):
+        rgn = r;
+        check_rgn_accessible(te,loc,rgn);
+--------------------------------------------------------------------------
+static type_t tcNew(tenv_t te0, seg_t loc, type_t * topt,
+                      exp_opt_t @rgn_handle, exp_t e, exp_t e1) {
+    // by default, we allocate heap pointers; this is for making inference
+    // simpler.  If you want a unique pointer, do rnew (Core::unique_region)
+    type_t rgn = heap_rgn_type;
+    let te = clear_abstract_val_ok(set_new_status(InNew,te0));
+    if (*rgn_handle != NULL) {
+      // check that the region handle is still valid
+      //JGMFIX: should just unify here
+      type_t expected_type =
+        rgn_handle_type(new_evar(&trko,lookup_opt_type_vars(te)));
+      type_t handle_type = tcExp(te,&expected_type,(exp_t)*rgn_handle);
+      switch (compress(handle_type)) {
+      case &AppType(&RgnHandleCon,&List{r,_}):
+        rgn = r;
+        check_rgn_accessible(te,loc,rgn);
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+ case &Switch_s(*exp,scs0,*dtp):
+ tcpat_result_t * next_pattern = NULL; // NULL in last case
+ bool first_case = true;
+
+ for(let scs = scs0; scs != NULL; scs = scs->tl) {
+    let p = scs->hd->pattern;
+    switch(p->r) {
+    case &Pointer_p(p2):
+      switch ((type_t)p->topt) {
+      case &PointerType(PtrInfo(_,_,PtrAtts(rt,...))):
+        check_rgn_accessible(te,p->loc,rt);
+
+---------------------------------------------------
+*/
+//TODO: Reject access to globals !
+//Solution:  Allow access to globals in not -pthread env 
+//TODO: Link safety: Should not allow linking of files compiled with
+							// -pthread and files not compiled with -pthread
+//TODO: Disallow Extention_e (gcc extention)
+
+
+/*
+///////////////////// Effect Stuff//////////////
+
+static rgneffect_t new_xrgn(type_t r , type_t p)
+{
+  let rg = Absyn::new_nat_cap(1,false);
+  let lk = Absyn::bot_cap();
+  return  new_rgneffect(r,clist(rg,lk),p);
+}
+
+static rgneffect_t new_xrgn(type_t r , type_t p);
+
+static effect_t join_env( Position::seg_t loc,effect_t env ,effect_t in, 
+									effect_t out,bool sp);
+
+static void add_xrgn( env_t env, type_t r )
+{
+  env->fenv->created_regions = new List(r, env->fenv->created_regions);
+}
+
+static void env_add_region( env_t env , 
+									 type_t r , 
+									 type_t p  )
+{
+  let fenv = get_fenv(env,"IOEffect::env_add_region");
+  //if( !fenv->is_io_eff_annot  ) return;
+  let z = new_xrgn(r,p);
+  add_xrgn(env,r);
+  fenv->f = new List(z,fenv->f);
+}
+
+static bool is_xrgn( env_t env , type_t r )
+{
+	let iter = env->fenv->created_regions;
+   let tv1 = type2tvar(r)->name;
+   for( ; iter != NULL ; iter = iter->tl)
+	{
+		let tv2 = type2tvar(iter->hd)->name;
+		if( strptrcmp(tv1,tv2) == 0 ) return true;
+	}
+	return false;
+}
+
+
+static bool ioeffect_exp_push( env_t env , exp_t e )
+{
+	let n = get_exp(env->fenv,e);
+	set_input_effect(n,env->fenv->f,e->loc);
+   return true; 
+}
+
+
+static bool ioeffect_stmt_push( env_t env , stmt_t s )
+{ let fenv = env->fenv;
+  let n = get_stmt(fenv,s);
+  set_input_effect(n,fenv->f,s->loc); //FIXME: s->loc wrong
+  node_opt_t nopt = peek_node(env); 
+  if( nopt != NULL )
+  {
+	 switch(nopt->n)
+	 {
+		case &Stmt(sa):
+			  switch(sa->r)
+			  {
+				case &IfThenElse_s(e,s1,s2): 
+					if( s == s1 &&  get_jump(get_exp(fenv,e)) == MustJump )
+					{
+						set_output_effect(nopt,fenv->f);
+						return false; //do not recurse
+					}
+					break;
+			   case &While_s(e,_): break;
+  				case &For_s(e1,$(e2,_),$(e3,_),s1):
+			   case &Switch_s(_,_,_): break;
+			   case &Do_s(_,_): break;
+			   case &TryCatch_s(_,_,_): break;
+				default: env_err("ioeffect_stmt_push");
+			  }
+			  break;
+		 default: env_err("ioeffect_stmt_push");
+	 }
+  }
+
+  switch(s->r)
+  {
+  	case &IfThenElse_s(_,_,_): fallthru;
+   case &While_s(_,_): fallthru; 
+   case &Switch_s(_,_,_): fallthru;
+   case &Do_s(_,_): fallthru;
+   case &TryCatch_s(_,_,_): fallthru;
+   case &For_s(_,_,_,_): push_node(env,n); break;
+	default: break;
+  }
+  return true;
+}
+
+static void ioeffect_stmt_pop( env_t env, stmt_t s )
+{
+  fenv_t fenv = env->fenv;
+  effect_t input = fenv->f;
+  node_opt_t nopt = peek_node(env); 
+  if( nopt != NULL )
+  {
+	 switch(nopt->n)
+	 {
+		case &Stmt(sa):
+			  switch(sa->r)
+			  {
+				 case &IfThenElse_s(e,s1,s2):
+					let na = get_stmt(fenv,sa);
+					let this_node = get_stmt(fenv,s);
+					set_input_effect(this_node,input,e->loc);
+					if( s == s1 )
+					{
+						 set_output_effect(nopt,fenv->f);
+					}
+					else if ( s == s2 )
+					{
+						
+					   //TODO: compare sopt->output with
+					}
+					else env_err("impossible");
+					break;
+			    case &While_s(_,_): break;
+			    case &Switch_s(_,_,_): break;
+			    case &Do_s(_,_): break;
+			    case &TryCatch_s(_,_,_): break;
+			    case &For_s(_,_,_,_):  break;
+				 default:  env_err("ioeffect_stmt_pop");
+			  }
+			  break;
+		 default: env_err("ioeffect_stmt_pop");
+	 }
+	  pop_node(env);
+  }
+  else
+  {
+   //TODO : set env output effect
+  }
+
+*/
+/*
+static void must_equal( Position::seg_t loc1,
+								effect_t f1, 
+								Position::seg_t loc2,
+							   effect_t f2,
+								string_t err 
+							 )
+{
+	 if(!cmp_effect(f1,f2))
+	 {
+
+	 	Tcutil::terr(loc1, "%s.\nEffect %s at line %s  !=  Effect %s at line %s",
+						err,
+						 effect2string(f1),
+						 Position::string_of_segment(loc1),
+						 effect2string(f2),
+						 Position::string_of_segment(loc2)
+						 );
+	 }
+}
+
+  case &IfThenElse_s(e,s1,s2):
+ 	 let in2 = copy_effect(fenv->f);
+	 let out1 = copy_effect(fenv->f);
+	 fenv->f = in2;
+  case &While_s($(e,cont_s),s):
+	 let in = copy_effect(fenv->f);
+    exp(env,e,annot);
+    stmt(env,s); //body
+	 stmt(env,cont_s); //continue
+	 must_equal(s->loc,fenv->f,cont_s->loc,in,"While statement");
+    break;
+  case &For_s(e1,$(e2,guard_s),$(e3,cont_s),s):
+	 let in = copy_effect(fenv->f);
+    exp(env,e1,annot);
+    exp(env,e2,annot);
+	 stmt(env,guard_s);
+    exp(env,e3,annot);
+	 stmt(env,cont_s);
+    stmt(env,s);
+	 must_equal(s->loc,fenv->f,cont_s->loc,in,"For statement");
+    break;
+  case &Do_s(s,$(e,cont_s)):
+	 let in = copy_effect(fenv->f);
+    stmt(env,s);
+    exp(env,e,annot);
+	 must_equal(s->loc,fenv->f,cont_s->loc,in,"Do statement");
+    break;
+  case &Switch_s(e,scs,dtp):
+   exp(env,e,annot);
+	let in = copy_effect(fenv->f);
+	let out = NULL;
+	let scs0 = scs;
+	for(; scs!=NULL; scs=scs->tl)
+	{
+    let sc = scs->hd;
+    let wc = sc->where_clause;
+	 let pat = sc->pattern;
+	 switch(pat->r)
+	 {
+      case &Pointer_p(p):
+			check_access(pat->loc,env,pat->topt);
+			break;
+		default: break;
+ 	 }
+    if(wc != NULL) exp(env,wc,annot);
+	 let in1 = copy_effect(in);
+    stmt(env,sc->body);
+	 //printf("\nChecking : %s\n", Absynpp::stmt2string(sc->body));
+	 if( out == NULL ) out = fenv->f;
+	 else must_equal(sc->body->loc,fenv->f,
+						  scs0->hd->body->loc,out,"Switch statement");
+   }
+    break;
+  case &TryCatch_s(s,scs,dtp0):
+		let dtp = (Tcpat::decision_t) dtp0;
+		stmt(env,s);
+		let scs0 = scs;
+		for(; scs!=NULL; scs=scs->tl)
+		{
+   	 let sc = scs->hd;
+	    let wc = sc->where_clause;
+   	 if(wc != NULL) exp(env,wc,annot);
+	    stmt(env,sc->body);
+   	}
+    break;
+
+  case &Decl_s(d,s1):
+    switch(d->r)
+	 {
+     case &Region_d(tv,_,eo):
+
+      if(eo != NULL )
+		{
+		  if(   ((int) eo->loc) < 0 )
+		  {
+			 push_enclosing_xrgn(env, stmt2decl(s) );
+//				set_xrgn_block(true);
+				let typ = Tcutil::compress(safe_cast(eo->topt,"stmt"));
+				switch(typ)
+				{
+					case &AppType(&HeapCon,_): 
+							env_add_region(env,Absyn::var_type(tv),heap_rgn_type);
+							break;
+  					case &AppType(&RgnHandleCon,ts) && ( ts->hd == heap_rgn_type ): 
+							env_add_region(env,Absyn::var_type(tv),heap_rgn_type);
+							break;
+  					case &AppType(&XRgnHandleCon,ts):
+						 let tv = Absyn::type2tvar(ts->hd);
+						 let fenv = get_fenv(env,"IOEffect::stmt");
+						 if(  find_rgneffect(tv,fenv->f) != NULL )
+						 {
+							 env_add_region(env,Absyn::var_type(tv),ts->hd);
+							 break;
+						 }
+						 fallthru;
+					default:
+			   	 Tcutil::terr(s->loc,"Invalid parent region handle %s"
+						,Absynpp::typ2string(typ));
+					 break;
+				}
+				
+		 }
+		 exp(env,eo,annot);
+	 }
+      stmt(env,s1);
+//		 printf("\n@@REGION output effect : find %s in %s", *tv->name , effect2string(fenv->f));
+      if(eo != NULL &&  ((int) eo->loc) < 0 )
+      {
+		 if(  find_rgneffect(tv,fenv->f) != NULL )
+		 {
+			 	 Tcutil::terr(d->loc,"Region is not freed by the end of its scope.");
+		 }
+			pop_enclosing_xrgn(env);
+//		 set_xrgn_block(false);
+      }
+      break;
+     case &Fn_d(fd):
+      analyze_fd(env->tables,fd,d->loc);
+      stmt(env,s1);
+      break;
+}
+*/
+
+/*
+
+void 	env_join_eff( Position::seg_t loc,env_t env, effect_t in,
+						   effect_t out , bool sp)
+{
+ let fenv = get_fenv(env,"IOEffect::env_join_eff");
+// if( !fenv->is_io_eff_annot  ) return;
+ fenv->f = join_env(loc,fenv->f,in,out,sp);
+ //printf("\nOutput fenv : %s\n", effect2string(fenv->f));
+// fflush(stdout);
+}
+
+
+static void exp(env_t env, Absyn::exp_t e, 
+										   Absyn::absyn_annot_t annot0 )
+{
+  let fenv = get_fenv(env,"IOEffect::exp");
+  let annot = e->annot;
+  switch (e->r)
+  {
+		  exp(env,e1,e->annot);
+		  exp(env,e2,e->annot);
+		  //TODO: 
+			// (a) e1 and e2 cannot throw exceptions:
+			//		 it is impossible to have the safe output effect as spawn
+			//	
+		  let i = fn_type(safe_cast(e1->topt,"exp"));
+		  env_join_eff(e1->loc,env,i.ieffect,i.oeffect,true);	
+		  break;
+	   case &FnCall_e(e1,es,_,_):
+
+			   type_t ftyp = safe_cast(e1->topt,"exp");
+				//FIXME: Fun may not have io_eff_annot but may contain
+				//			special Region_d constructs
+			  if( fenv->is_io_eff_annot  && !has_io_eff_annot(ftyp) )
+			  {
+					 Tcutil::terr(e->loc,"Invalid function call: Function type %s has no @ieffect anotation. This is disallowed in the current context."
+						,Absynpp::typ2string(ftyp));
+			  }
+			  // STEP 1: Determine e1 jumps
+				check_access(e1->loc,env,ftyp);
+				exp(env,e1,annot);
+				let n1 = get_exp(fenv,e1);
+				let n  = get_exp(fenv,e);
+				if( n1->annot == MustJump ) //we're done
+				{
+				  set_input_effect(n,fenv->f,e1->loc);
+				  set_output_effect(n,fenv->f);
+				  n->annot = MustJump;
+				  break;
+				}
+				// STEP 2: Determine e2 (i.e. args) jumps
+				if( es != NULL )
+				{
+					let my_n = MayJump;
+					let loc1 = es->hd->loc;
+					for( ; es != NULL ; es = es->tl )
+				   {
+						exp(env,es->hd,annot);
+						let n2 = get_exp(fenv,es->hd);
+						if( n2->annot == MustJump )
+						{
+						  loc1 = es->hd->loc;
+						  my_n = MustJump;
+						  break;
+						} 
+						my_n = n2->annot>=my_n?n2->annot:my_n;
+					}
+					set_input_effect(n,fenv->f,loc1);
+			      if( my_n == MustJump )  // we're done
+				   {
+						  set_output_effect(n,fenv->f);
+						  n->annot = MustJump;
+						  break;
+					}
+					n->annot = my_n;
+				}
+				// STEP 3: Determine Function call jumps (exns)
+			  let i = fn_type(ftyp);
+				//add_throws(env,e);
+				//if( i.throws != NULL && !is_nothrow(i.throws) )
+				//	n->annot = MayJump;
+
+			  // STEP 1: Calculate output effect
+			  env_join_eff(e1->loc,env,i.ieffect,i.oeffect,false);
+			  // STEP 2: Set input/output expression effect
+//			  let = get_exp(
+
+	
+
+		  			
+				break;
+	   case &Deref_e(e1):
+			 check_access(e1->loc,env,e1->topt);
+			 exp(env,e1,annot);
+			 break;
+	   case &Subscript_e(e1,e2):
+			 let typ = Tcutil::compress(safe_cast(e1->topt,"exp"));
+		 	 check_access(e1->loc,env,typ);
+			 exp(env,e1,annot);
+			 exp(env,e2,annot);
+			 break;
+  		case &Malloc_e(MallocInfo{.rgn=ropt,.num_elts=e2,...}):
+			 fallthru(ropt,e2);
+  		case &New_e(ropt,e2):
+		    if(ropt!=NULL)
+			 {
+			 	 check_access(ropt->loc,env,ropt->topt);
+				 exp(env,ropt,annot);
+			 }
+			 exp(env,e2,annot);
+		    break;
+  		case &Datatype_e(es,_,_): fallthru(es);
+	   case &Tuple_e(es):        fallthru(es);
+	   case &Primop_e(_,es):
+			for( ; es != NULL ; es = es->tl ) exp(env,es->hd,annot); break;
+	   case &Asm_e(...):	break; //FIXME: issue error ?
+	   case &Const_e(...):    fallthru;
+	   case &Sizeoftype_e(_): fallthru;
+	   case &Sizeofexp_e(_):  fallthru;
+	   case &Offsetof_e(...): fallthru;
+	   case &Valueof_e(_):    fallthru;
+	   case &Pragma_e(_):     break; // set_exp_jump(fenv,e,MayJump); break;
+	   case &Enum_e(...):
+	   case &AnonEnum_e(...):
+	   case &Var_e(...):  break;
+	   case &StmtExp_e(s):
+				stmt(env,s); 
+				break;
+
+	   case &ComprehensionNoinit_e(e1,_,_): fallthru(e1);
+	   case &Extension_e(e1):       fallthru(e1);
+	   case &Tagcheck_e(e1,_):      exp(env,e1,annot); break;
+	   case &Address_e(e1): 
+			   exp(env,e1,annot);
+				break;
+
+	   case &AggrMember_e(e1,...): 
+			  exp(env,e1,annot);
+			  break;
+
+	   case &AggrArrow_e(e1,_,is_tagged,is_read): 
+			// depends on toc.cyc check insertion
+				
+			   exp(env,e1,annot);
+				break;
+	   case &Cast_e(_,e1,_,_):      fallthru(e1);
+	   case &NoInstantiate_e(e1):   fallthru(e1);
+	   case &Instantiate_e(e1,...):
+			 exp(env,e1,annot);
+			 break;
+	   case &Throw_e(e1,...): 
+			fallthru(e1);
+	   case &Increment_e(e1,...):  
+			exp(env,e1,annot);
+			break;
+	   case &Conditional_e(e1,e2,e3):
+    		 exp(env,e1,annot);
+			 exp(env,e2,annot);
+			 exp(env,e3,annot);
+			 break;
+	   case &Comprehension_e(_,e1,e2,_): 
+			exp(env,e1,annot);
+			exp(env,e2,annot);
+			break;
+	   case &AssignOp_e(e1,_,e2): 
+				exp(env,e1,annot); exp(env,e2,annot);
+				break;
+	   case &Swap_e(e1,e2):      fallthru(e1,e2);
+	   case &And_e(e1,e2):       fallthru(e1,e2);
+	   case &Or_e(e1,e2):        fallthru(e1,e2);
+	   case &SeqExp_e(e1,e2):    exp(env,e1,annot); 	exp(env,e2,annot); break;
+	   case &AnonStruct_e(_,dles):    fallthru(dles);
+	   case &Aggregate_e(_,_,dles,_): fallthru(dles);
+	   case &CompoundLit_e(_,dles):   fallthru(dles);
+	   case &Array_e(dles):
+		    for(; dles!=NULL; dles=dles->tl)  exp(env,(*dles->hd)[1],annot);
+		    break;
+	   case &UnresolvedMem_e(...):
+			 Warn::impos("I/O Effect analysis found UnresolvedMem_e");
+  }
+}
+
+static void stmt(env_t env, Absyn::stmt_t s)
+{
+  let fenv = env->fenv; 
+  let annot = s->annot;
+  switch(s->r)
+  {
+   case &Skip_s: break;
+   case &Break_s:
+   case &Continue_s:
+   case &Goto_s(_): break;
+
+  case &Return_s(eopt):
+    if(eopt!=NULL)	   exp(env,eopt,annot);
+    break;
+  case &Fallthru_s(es,clauseopt):
+    // assuming type-checker (still) sets clauseopt!!
+	 //let my_n = MayJump; // bot
+    for(; es!=NULL; es=es->tl)
+	 {
+		 exp(env,es->hd,annot);
+		 //let n = get_exp(fenv,es->hd);
+		 //if( n->annot > my_n ) my_n = n->annot;
+	 }
+	 // set_stmt_jump(fenv,s,my_n);
+	 add_stmt_succ(fenv,s,(*safe_cast(clauseopt,"stmt"))->body);
+    break;
+  case &Label_s(lab,s1):
+    stmt(env,s1);
+	 let n = get_stmt(fenv,s1);
+	 //set_stmt_jump(fenv,s,n->annot);
+    break;
+  case &Exp_s(e):
+		exp(env,e,annot); 
+		let n = get_exp(fenv,e);
+		//set_stmt_jump(fenv,s,n->annot);
+		break;
+  case &Seq_s(s1,s2):
+	//let n = get_stmt(fenv,s1);
+	//if( n->annot == MustJump )	set_stmt_jump(fenv,s,MustJump);
+	  stmt(env,s1);
+	  stmt(env,s2);
+	   break;
+	  //let n1 = get_stmt(fenv,s2);
+	  //set_stmt_jump(fenv,s,(n1->annot >= n->annot )?n1->annot:n->annot);
+	
+   break;
+  case &IfThenElse_s(e,s1,s2):
+    exp(env,e,annot);
+	 let n = get_exp(fenv,e);
+	 if( n->annot == MustJump ) set_stmt_jump(fenv,s,MustJump);
+	 else
+	 {
+		 let in2 = copy_effect(fenv->f);
+	    stmt(env,s1);
+		 let out1 = copy_effect(fenv->f);
+		 fenv->f = in2;
+	    stmt(env,s2);
+		 //let n1 = get_stmt(fenv,s1);
+//		 let n2 = get_stmt(fenv,s2);
+//		 switch($
+//set_input_effect( node_t n, effect_t f , Position::seg_t loc )
+		 //printf("\ns2 : %s" ,Absynpp::stmt2string(s2));
+	//	 must_equal(s1->loc,out1,s2->loc,fenv->f,"If then else statement");
+	 }
+    break;
+  case &While_s($(e,cont_s),s):
+	 let in = copy_effect(fenv->f);
+    exp(env,e,annot);
+    stmt(env,s); //body
+	 stmt(env,cont_s); //continue
+	 must_equal(s->loc,fenv->f,cont_s->loc,in,"While statement");
+    break;
+  case &For_s(e1,$(e2,guard_s),$(e3,cont_s),s):
+	 let in = copy_effect(fenv->f);
+    exp(env,e1,annot);
+    exp(env,e2,annot);
+	 stmt(env,guard_s);
+    exp(env,e3,annot);
+	 stmt(env,cont_s);
+    stmt(env,s);
+	 must_equal(s->loc,fenv->f,cont_s->loc,in,"For statement");
+    break;
+  case &Do_s(s,$(e,cont_s)):
+	 let in = copy_effect(fenv->f);
+    stmt(env,s);
+    exp(env,e,annot);
+	 must_equal(s->loc,fenv->f,cont_s->loc,in,"Do statement");
+    break;
+  case &Switch_s(e,scs,dtp):
+   exp(env,e,annot);
+	let in = copy_effect(fenv->f);
+	let out = NULL;
+	let scs0 = scs;
+	for(; scs!=NULL; scs=scs->tl)
+	{
+    let sc = scs->hd;
+    let wc = sc->where_clause;
+	 let pat = sc->pattern;
+	 switch(pat->r)
+	 {
+      case &Pointer_p(p):
+			check_access(pat->loc,env,pat->topt);
+			break;
+		default: break;
+ 	 }
+    if(wc != NULL) exp(env,wc,annot);
+	 let in1 = copy_effect(in);
+    stmt(env,sc->body);
+	 //printf("\nChecking : %s\n", Absynpp::stmt2string(sc->body));
+	 if( out == NULL ) out = fenv->f;
+	 else must_equal(sc->body->loc,fenv->f,
+						  scs0->hd->body->loc,out,"Switch statement");
+   }
+    break;
+  case &TryCatch_s(s,scs,dtp0):
+		let dtp = (Tcpat::decision_t) dtp0;
+		stmt(env,s);
+		let scs0 = scs;
+		for(; scs!=NULL; scs=scs->tl)
+		{
+   	 let sc = scs->hd;
+	    let wc = sc->where_clause;
+   	 if(wc != NULL) exp(env,wc,annot);
+	    stmt(env,sc->body);
+   	}
+    break;
+
+  case &Decl_s(d,s1):
+    switch(d->r)
+	 {
+     case &Region_d(tv,_,eo):
+
+      if(eo != NULL )
+		{
+		  if(   ((int) eo->loc) < 0 )
+		  {
+			 push_enclosing_xrgn(env, stmt2decl(s) );
+//				set_xrgn_block(true);
+				let typ = Tcutil::compress(safe_cast(eo->topt,"stmt"));
+				switch(typ)
+				{
+					case &AppType(&HeapCon,_): 
+							env_add_region(env,Absyn::var_type(tv),heap_rgn_type);
+							break;
+  					case &AppType(&RgnHandleCon,ts) && ( ts->hd == heap_rgn_type ): 
+							env_add_region(env,Absyn::var_type(tv),heap_rgn_type);
+							break;
+  					case &AppType(&XRgnHandleCon,ts):
+						 let tv = Absyn::type2tvar(ts->hd);
+						 let fenv = get_fenv(env,"IOEffect::stmt");
+						 if(  find_rgneffect(tv,fenv->f) != NULL )
+						 {
+							 env_add_region(env,Absyn::var_type(tv),ts->hd);
+							 break;
+						 }
+						 fallthru;
+					default:
+			   	 Tcutil::terr(s->loc,"Invalid parent region handle %s"
+						,Absynpp::typ2string(typ));
+					 break;
+				}
+				
+		 }
+		 exp(env,eo,annot);
+	 }
+      stmt(env,s1);
+//		 printf("\n@@REGION output effect : find %s in %s", *tv->name , effect2string(fenv->f));
+      if(eo != NULL &&  ((int) eo->loc) < 0 )
+      {
+		 if(  find_rgneffect(tv,fenv->f) != NULL )
+		 {
+			 	 Tcutil::terr(d->loc,"Region is not freed by the end of its scope.");
+		 }
+			pop_enclosing_xrgn(env);
+//		 set_xrgn_block(false);
+      }
+      break;
+     case &Fn_d(fd):
+      analyze_fd(env->tables,fd,d->loc);
+      stmt(env,s1);
+      break;
+	  case &Let_d(_,_,e,dtp0):
+		let dtp = safe_cast(dtp0,"exp Let_d");
+      exp(env,e,annot);
+      stmt(env,s1);
+      break;
+     case &Letv_d(vdl):
+		let x = NULL;
+		for( ; vdl != NULL ; vdl = vdl->tl)
+		{
+			x = vdl->hd->initializer;
+			if( x !=NULL )  exp(env,x,annot);
+		}
+		stmt(env,s1);
+		break;
+     case &Var_d(vd):
+			let x = vd->initializer;
+			if( x != NULL ) exp(env,x,annot);
+		   stmt(env,s1);
+			break;
+	  default:
+		 Warn::impos("IOEffect::stmt : Unhandled statement %s",
+						 Absynpp::stmt2string(s));
+    }
+    break;
+  }
+//  env_check_output_effect(s->loc,env,s);
+}
+*/
+
+/*
+/////////////////////////////////////////////////
+////////// Effect Flow analysis //////////////
+static void env_check_jump_table
+( 
+	Position::seg_t loc,
+   env_t env,
+   Absyn::stmt_t s
+)
+{
+  let fenv = get_fenv(env,"IOEffect::env_check_jump_table");
+  let out = fenv->f;
+  let tab = env->tables->succ_tables;
+  let opt = 	Hashtable::lookup_opt
+  					(tab,fenv->fd);
+  if( opt == NULL ) 
+  	 env_err("IOEffect::env_check_jump_table 1");
+  switch(Hashtable::lookup_opt(*opt,s))
+  {
+	case &opt1 && opt1 != NULL: 
+		 printf("\n^^^^^^^^^^^^env_check_jump_table: Statement : %s Succ : %s",
+					Absynpp::stmt2string(s),
+					Absynpp::stmt2string(opt1));
+			// jump_stmt input effect == out
+FIXME
+			se_ins(fenv->stmt_effect ,  
+					 safe_cast(opt1,"env_check_jump_table 2") , 
+			 	    out,
+					  loc
+				   ); // add a constraint to successor
+
+			break;
+		default: break;
+  }
+}
+
+static bool env_check_catch_blocks
+( 
+	Position::seg_t loc,
+   env_t env,
+   Absyn::stmt_t s)
+{
+  let fenv= get_fenv(env,"IOEffect::env_check_catch_blocks");
+  let out = fenv->f;
+  let iter = fenv->catch_stack;
+  return false;
+}
+
+static void env_check_output_effect
+ ( Position::seg_t loc,
+   env_t env,
+   Absyn::stmt_t s )
+{
+    let fenv= get_fenv(env,
+					"IOEffect::env_check_output_effect");
+    if( !fenv->is_io_eff_annot  ) return;
+	 let out = fenv->f;
+	 env_check_jump_table(loc,env,s);
+	 if( !env_check_catch_blocks(loc,env,s) )
+	 {
+		//must_equal(loc,out,fenv->loc,fenv->out);
+    }
+}
+*/
+
+/*
+Absyn::type_t pointer_type( Absyn::type_t t )
+{
+  switch (Tcutil::compress(t)) 
+  {
+  case &PointerType(PtrInfo(t1,tq,PtrAtts(rgn,x,b,zt,_))):
+	 return Tcutil::compress(t1);
+  default: env_err("IOEffect::pointer_type");
+  }
+}
+// @requires a stack of at least three items
+void calculate_throws_and_pop
+		(Position::seg_t loc, 
+		 env_t te ,
+		 datatype Tcpat::Decision @`H d )
+{
+	let throws = (get_fenv(te,"IOEffect::calculate_throws_and_pop")->throws);
+   let $(scatch,stry) = $((*throws)->hd,
+								   (*throws)->tl->hd);
+	pop_throws_scope(te);pop_throws_scope(te); // pop twice
+	let uncaught =  Absyn::uncaught_exn
+								(loc,d,stry,scatch);
+	 throws = get_fenv(te,"IOEffect ::calculate_throws_and_pop")->throws;
+	 if( uncaught == NULL ) return;
+	 if( throws == NULL ) env_err("HERE1");
+	 if( *throws == NULL ) env_err("HERE2");
+	for( ; uncaught != NULL ; uncaught = uncaught->tl ) //merge with env
+		(*throws)->hd = Absyn::add_qvar((*throws)->hd,uncaught->hd);
+}
+
+*/
+/*
+static void ioeffect_exp_push( env_t env, exp_t e )
+{
+  let n = get_exp(env->fenv,e);
+  let npar = peek_node(env);
+  switch(e->r)
+  {
+		case &Conditional_e(_,_,_):  push_node(env,n); break;
+		default: break;
+  }
+  if( npar != NULL )
+  {
+	 switch(npar->n)
+	 {
+		case &Stmt(s): break;
+		case &Exp(e0):
+			switch(e0->r)
+			{
+				case &Conditional_e(e1,e2,e3):
+					if( e == e1 ) break;
+					else if( e != e2 && e != e3 ) env_err("ioeffect_exp_push");
+					let out = get_output(get_exp(env->fenv,e1));
+					if( e == e3 )
+					{
+						env->fenv->f = out; //reset effect for else branch
+					}
+					set_input_effect(n,out,e->loc);
+					return;
+				default: break;
+			}
+			break;
+	 }
+  }
+  set_input_effect(n,env->fenv->f,e->loc);
+}
+
+static effect_t join_effect( Position::seg_t loc1,effect_t f1,
+									  Position::seg_t loc2,effect_t f2)
+{
+  switch($(f1,f2))
+  {
+	 case $(NULL,_): return f2;
+	 case $(_,NULL): return f1;
+	 default:
+	  if(!cmp_effect(f1,f2)) // strict equality
+	  {
+		let is = Position::string_of_segment(loc1); 
+		let cs = Position::string_of_segment(loc2); 
+		let f1s = effect2string(f1);
+		let f2s = effect2string(f2);
+	 	Tcutil::terr(loc2,"The output effect  %s (set at %s) does not match the output effect %s (set at %s)",
+						  f1s,is,f2s,cs);
+	  } 
+	  return f1;
+  }
+}
+
+static void ioeffect_exp_pop( env_t env, exp_t e )
+{
+  let fenv = env->fenv;
+  bool spwn = false;
+  let n = get_exp(fenv,e);
+   switch (e->r)
+   {
+	   case &FnCall_e(e1,_,_,_):
+			  let i = fn_type(check_fun_call_ptr(env,e1,spwn,e->loc)); 
+			  env_join_eff(e1->loc,env,i.ieffect,i.oeffect,spwn);
+			  break;
+	   case &Deref_e(e1): check_access(e1->loc,env,e1->topt); break;
+	   case &Subscript_e(e1,e2): check_access(e1->loc,env, Tcutil::compress(safe_cast(e1->topt,"exp")));break;
+  		case &Malloc_e(MallocInfo{.rgn=ropt,.num_elts=e2,...}): fallthru(ropt,e2);
+  		case &New_e(ropt,e2): if(ropt!=NULL) check_access(ropt->loc,env,ropt->topt); break;
+		case &Conditional_e(e1,e2,e3):
+				let n2 = get_exp(fenv,e2);
+				let n3 = get_exp(fenv,e3);
+				fenv->f = join_effect(e2->loc,get_output(n2),e3->loc,get_output(n3));
+				break;
+		default: break;
+   }
+  set_output_effect(n,fenv->f);
+  pop_node(env);
+}
+static void check_throws_validity(env_t te)
+{
+   let fenv =  get_fenv(te,"IOEffect::check_throws_validity");
+	let inf = (*fenv->throws)->hd;
+	let annot = fenv->annot;
+	let notin = NULL;
+	switch(fenv->is_throw_annot)
+	{
+		case 0: fallthru;
+		case 3: break;
+		case 1: if( inf != NULL )
+	     Tcutil::terr(fenv->loc, 
+				"This function was declared with @nothrow attribute but it may throw the following exceptions: %s.",qvl2string(inf));
+		  break;
+		default: 
+		  let it = inf;
+		  let err = false;
+			for(  ; it != NULL ; it = it->tl )
+				if(!Absyn::exists_throws(annot,it->hd))
+				{
+			     Tcutil::terr(fenv->loc, 
+						"This function was declared with @throws attribute but it throws exceptions other than the ones specified. Example: %s.",
+						 q2string(it->hd));
+					err = true;
+				}
+			if(err)  Tcutil::terr(fenv->loc, "Inferred exceptions of function body: %s",qvl2string(inf));
+		  break;
+	}
+}
+
+static char throw_annot( type_t t )
+{
+   let x =  fn_throw_annot(t);
+	if( x == NULL ) return 0;
+	else if( is_nothrow(x) ) return 1;
+	else if( is_throwsany(x) ) return 3;
+	else return 2;
+}
+
+
+
+*/
+/*
+typedef Hashtable::table_t<stringptr_t<`H,`H>,`a> string_map_t<`a>;
+void string_map_insert(string_map_t<`a> m, stringptr_t<`H,`H> p, `a val,
+							  `a (@ combine)(`a,`a) )
+{
+  let x = Hashtable::lookup_opt(m,p);
+  if( x == NULL )  Hashtable::insert(m,p,val);
+  else return   Hashtable::insert(m,p,combine(*x,val));
+}
+
+string_map_t<`a> string_map_create()
+{ return Hashtable::create(107,strptrcmp,Hashtable::hash_stringptr);}
+
+
+*/
+
+
+
+////////////////////////////////////////////////////
+

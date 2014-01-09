@@ -1,0 +1,4 @@
+svn co svn+ssh://svn.softlab.ntua.gr/var/lib/svnrepos/svn-pl/internal/reglock/branches/cyclone/0.8.3
+ cd 0.8.3
+./configure --prefix=TARGET_DIR && make all update clean && make all && make install
+cyclone -c tests/ioeffect/pass/reentrant1.cyc

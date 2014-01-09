@@ -1,0 +1,225 @@
+# The Computer Language Benchmarks Game
+# $Id: my.linux.ini,v 1.6 2010-03-09 21:03:51 igouy-guest Exp $
+
+
+;;; SECTIONS
+; [measure] [dirs] [filters] [alias] [build] [tools] [commandlines]
+
+;;; TEST SPECIFIC SECTIONS
+; [testrange] [testdata] [outputcheck] [ndiff_outputcheck]
+
+
+
+[measure]
+
+; how many repeated measurements at the same [testrange] value?
+runs = 10
+
+; repeat measurements at every [testrange] value
+; or just the largest? (True or False)
+repeatevery = False
+
+; how many seconds before we timeout a program?
+maxtime = 1000
+
+; only do repeated measurements for [testrange] values which
+; took less than cutoff seconds
+cutoff = 300
+
+logfilemax = 102400
+
+delay = 0.2 ; memory sampling delay for linux, not used for win32
+
+
+;;; SITE SPECIFIC ====================
+
+[dirs]
+
+;;; THESE 7 MUST MATCH WHERE YOU INSTALLED bencher
+
+; 1) MUST set local root
+root=XINFERDIR/shootout/bin/bencher/tmp
+
+; 2) root for source code directories of programs that should be measured
+src=XINFERDIR/shootout/bin/bencher/programs/
+
+; 3) makefile
+makefile=XINFERDIR/shootout/bin/bencher/makefiles/my.linux.Makefile
+
+; 4) bencher
+nano =XINFERDIR/shootout/bin/bencher/
+
+; 5) if not empty, somewhere all csv summary data files should be put
+dat_sweep=XINFERDIR/shootout/bin/bencher/summary/
+
+; 6) if not empty, somewhere all source code markup should be put
+code_sweep=XINFERDIR/shootout/bin/bencher/run_markup/
+
+; 7) if not empty, somewhere all program log text files should be put
+log_sweep =XINFERDIR/shootout/bin/bencher/run_logs/
+
+
+
+[filters]
+
+; ONLYDIRS explicitly listed are searched for source code files
+
+onlydirs = 
+  binarytrees 
+  chameneosredux 
+  fannkuch 
+  mandelbrot 
+  regexdna  
+  spectralnorm 
+  threadring
+
+
+; ALLOW these helper file extensions to be available unchanged 
+; from the working directory - they will never be measured
+
+allow = 
+
+
+
+; ONLY measure files with these extensions 
+; if there are none, measure files with any extension not ALLOWed or IGNOREd
+
+only = cyc c
+
+
+; IGNORE files with these extensions, if there are no ONLY extensions
+
+ignore =
+ txt
+
+
+[alias]
+
+; x=y z - additionally measure source file x with implementations y and z
+
+python = compiledpython
+
+
+
+[build]
+
+make =
+   cyc
+   c
+
+
+
+[tools]
+
+; some of these need to be available to MAKE as well as substituted
+; in commandlines, so we'll export them as shell variables
+
+
+PYTHON = /usr/bin/python
+
+JDKRUN = /usr/bin/java
+JDKC = /usr/bin/javac
+
+GCC = /usr/bin/gcc
+
+
+
+[commandlines]
+
+; commandlines are split on spaces, so "a b" and 'a b' will be split
+
+; %X %T %B %I %A in commandlines are replaced like this:
+;
+; nbody.python-4.python %X = nbody.python-4.python
+; nbody.python-4.python %T = nbody
+; nbody.python-4.python %B = nbody.python-4
+; nbody.python-4.python %I = 4
+;
+; %A = [testrange] value or 0 when the program takes input from stdin
+
+
+python = $PYTHON %X %A
+compiledpython = $PYTHON %B.pyo %A
+
+; (For multiprocessing make sure the extension is .py)
+;python = $PYTHON -O %B.py %A
+
+java = $JDKRUN $JDKFLAGS -server %T %A
+javaxint = $JDKRUN $JDKFLAGS -server -Xint %T %A
+
+cyc = %T.cyc_run %A
+c = %T.c_run %A
+
+
+;;; TEST SPECIFIC ====================
+
+[testrange]
+
+; One or more input values, programs will be run at least once
+; with each input value replacing %A in the command line.
+;
+; Or when there's [testdata] for programs the input value
+; makes up part of the filename - the file contents will be
+; redirected to stdin.
+;
+; In this example, the input file for regexdna should be named
+;    regexdna-input10000.txt
+; and should be located in
+;    bencher/tmp/regexdna
+
+regexdna = 1
+binarytrees = 20
+chameneosredux = 6000000
+fannkuch = 12
+mandelbrot = 16000
+spectralnorm = 5500
+threadring = 50000000
+
+[testdata]
+regexdna=XINFERDIR/shootout/bin/bencher/programs/regexdna/regexdna.txt
+
+[outputcheck]
+
+; Program output is usually checked against an "expected" output
+; file. If there's no "expected" output file then the output of the
+; first program measured for that test becomes the "expected" output
+; - so make sure that output is correct!
+
+; The default output check uses GNU diff.
+; If GNU diff isn't found the default output check uses filecmp.cmp
+;
+; Other options are:
+;    prevent output check, use GNU cmp, use ndiff
+
+
+
+; prevent output being checked for the named test
+
+notchecked =
+   chameneosredux
+;  mandelbrot
+;  nbody
+
+
+; check binary output with cmp for the named test
+
+binarycmp =
+ mandelbrot
+
+
+[ndiff_outputcheck]
+
+; check output with ndiff and these parameters for the named test
+
+;chameneosredux = -fields 2-10
+;nbody = -abserr 1.0e-8
+
+
+
+; ENVIRONMENT for specific tests
+; some of these need to be available to MAKE as well as substituted
+; in commandlines, so we'll export them as shell variables
+
+
+
+

@@ -1,0 +1,93 @@
+
+
+#define XRGN
+#include <core.h>
+
+datatype exn {
+  Bad_error,
+  Really_Bad_error;
+}; 
+
+datatype exn.Bad_error Bad_error_val =  Bad_error;
+
+int a =10;
+//int f (int a,int b) { return a; } 
+int main(){
+  //int *`H p =&a;
+  //int b = 10;
+
+//A:
+
+/*
+ try {
+    a = 6000;
+    if(a) throw new Bad_error;
+    else throw new Really_Bad_error;
+ } catch {
+   case &Really_Bad_error:
+        a += 700;
+        fallthru;
+   case &Bad_error:
+        a += 500;
+        fallthru;
+   default:
+       a += 250;
+       break;
+ }
+*/
+
+
+B: 
+  for( _ iter = 10; iter > 0 ;
+          iter --){
+  switch(a) {
+    case 1500:
+         a += 500;
+         fallthru; // continue;
+    case 3000:
+         a += 100;
+         continue;
+    default:
+         a += 250;
+         break;
+   }
+
+
+  if(a)  goto B;
+
+
+    //  f(a+1,a+10);
+//      if(a-3000) continue;
+//      if(a) break;
+      //++a;
+  }
+
+
+/*  while(1) {
+      if(b) continue;
+      if(a) break;
+      f(a+1,a+10);
+   }
+
+ try {
+ do {
+      if(b) continue;
+      if(a) break;
+      f(a+1,a+10);
+ } while( a > 
+         (b?(throw &Bad_error_val):
+            b+1));
+ } catch { 
+   case &Bad_error:
+       a = a + 600;
+       fallthru;
+   default:
+       b = b + 700;
+ }*/
+
+// if(b) goto A;
+// if(a) goto B;
+/* b+= 30;
+ B: a += 40;*/
+  return -1;
+}

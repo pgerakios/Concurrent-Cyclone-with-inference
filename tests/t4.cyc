@@ -1,0 +1,33 @@
+#include <core.h>
+#include <stdio.h>
+int n  = 0;
+int zoo() @xrgn;
+
+void goo() { }
+int doo() {
+}
+int bar() {
+ printf("\nHello world");
+// zoo();
+ doo();
+ goo();
+ return 0;
+}
+
+int foo() { 
+  if(n) bar();
+  doo();
+  return 0;
+}
+
+int main() {
+  region h0;
+  region h @ Core::heap_region;
+  doo();
+  cap(h,1,0,0);
+ if(n) foo();
+  bar();
+  goo();
+  cap(h,-2,0,0);
+  return 0;
+}

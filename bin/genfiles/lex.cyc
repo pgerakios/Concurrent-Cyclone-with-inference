@@ -1,0 +1,1431 @@
+#line 1 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+ 
+/* Lexer.
+   Copyright (C) 2001 Greg Morrisett, AT&T
+   This file is part of the Cyclone compiler.
+
+   The Cyclone compiler is free software; you can redistribute it
+   and/or modify it under the terms of the GNU General Public License
+   as published by the Free Software Foundation; either version 2 of
+   the License, or (at your option) any later version.
+
+   The Cyclone compiler is distributed in the hope that it will be
+   useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with the Cyclone compiler; see the file COPYING. If not,
+   write to the Free Software Foundation, Inc., 59 Temple Place -
+   Suite 330, Boston, MA 02111-1307, USA. */
+
+// WARNING: Because we now intern identifiers, you better never mutate them!
+// WARNING: lex_init must be called for each source file!
+
+#include <lexing.h>
+#include <set.h>
+#include <string.h>
+#include <xarray.h>
+#include "parse.h"
+#include <dict.h>
+#include "tcutil.h"
+#include "binding.h"
+#include "warn.h"
+using Core;
+using List;
+using Lexing;
+using Parse;
+using Absyn;
+
+extern void yyerror(string_t<`H> s, int state, int token);
+
+namespace Lex {
+
+struct Trie<`r::R>;
+typedef struct Trie<`r> *`r trie_t<`r>;
+@tagged union TrieChildren<`r::R> {
+  int Zero;
+  $(int, trie_t<`r>) One;
+  trie_t<`r> @{64}`r Many; // enough room for id chars and `
+};
+union TrieChildren<`r> Zero() { return TrieChildren{.Zero = 0}; }
+union TrieChildren<`r> One(int i,trie_t<`r> t) { 
+  return TrieChildren{.One = $(i,t)}; 
+}
+union TrieChildren<`r> Many(trie_t<`r>@{64}`r ts) {
+  return TrieChildren{.Many = ts}; 
+}
+struct Trie<`r> {
+  union TrieChildren<`r> children;
+  int shared_str; // meaning depends on which trie -- see below
+};
+struct DynTrie {<`d> 
+  uregion_key_t<`d>  dyn;
+  trie_t<`d>         t;
+};
+typedef struct DynTrie *`U dyn_trie_t;
+struct DynTrieSymbols {<`d> 
+  uregion_key_t<`d>  dyn;
+  trie_t<`d>         t;  //int field is symbol index, 0 for not there
+  Xarray::xarray_t<stringptr_t,`d> symbols;
+};
+typedef struct DynTrieSymbols *`U dyn_trie_symbols_t;
+
+/////////////////////////////// Globals /////////////////////////////
+
+// These must be (re-)initialized in lex_init.
+static int    num_kws  = 0;
+struct KeyWordInfo { int token_index; bool is_c_keyword; };
+static struct KeyWordInfo ?  kw_nums  = NULL;
+
+bool compile_for_boot_r = false;
+bool expand_specials = false;
+// state for recording whether or not we're parsing C code
+static bool in_extern_c = false;
+static list_t<bool,`U> prev_extern_c = NULL;
+void enter_extern_c() {
+  list_t<bool,`U> x = NULL;
+  x :=: prev_extern_c;
+  prev_extern_c = unew List(in_extern_c,x);
+  in_extern_c = true;
+}
+void leave_extern_c() {
+  list_t<bool,`U> x = NULL;
+  x :=: prev_extern_c;
+  in_extern_c = x->hd;
+  prev_extern_c = x->tl;
+  ufree(x);
+}
+
+static dyn_trie_symbols_t ids_trie  = NULL;
+static dyn_trie_t typedefs_trie = NULL;//int field true iff path is a typedef
+
+static int comment_depth = 0;
+
+// These needn't be set by lex_init -- they're set while finding a token.
+static cnst_t               token_int = Cnst{.Int_c = $(Signed,0)};
+static string_t             bogus_string   = "*bogus*";
+static $(nmspace_t,var_t)   token_id_pair = $(Nmspace{.Loc_n = 0},
+					      &bogus_string);
+
+static char                 token_char   = '\000';
+string_t                    token_string = "";
+qvar_t                      token_qvar   = &token_id_pair;
+//static $(bool,string_t<`H>) token_asm = $(false,"");
+
+static int runaway_start = 0;
+static int paren_depth = 0; // used for __asm__ parsing
+
+static void err(string_t<`H> msg, Lexbuf lb) {
+  seg_t s = lexeme_start(lb);
+  Warn::err(s,msg);
+}
+static void runaway_err(string_t<`H> msg, Lexbuf lb) {
+  seg_t s = runaway_start;
+  Warn::err(s,msg);
+}
+static char cnst2char(cnst_t cnst, Lexbuf lb) {
+  switch (cnst) {
+  case {.Int_c      = $(_,i)}: return (char)i;
+  case {.LongLong_c = $(_,i)}: return (char)i;
+  case {.Char_c     = $(_,c)}: return c;
+  default: err("couldn't convert constant to char!",lb); return (char)0;
+  }
+}
+
+// ************************** RESERVED WORDS **************************
+// bool is true when the keyword is a GCC keyword as opposed to 
+// a Cyclone keyword
+static $(string_t,short,bool) rw_array[] = {
+  $("__attribute__", ATTRIBUTE, true),
+  $("__attribute", ATTRIBUTE, true),
+  $("abstract", ABSTRACT, false),
+  $("auto", AUTO, true),
+  $("break", BREAK, true),
+  $("__builtin_va_list", BUILTIN_VA_LIST, true),
+  $("calloc", CALLOC, false),
+  $("case", CASE, true),
+  $("catch", CATCH,true),
+  $("char", CHAR, true),
+  $("const", CONST, true),
+  $("__const__", CONST, true),
+  $("continue", CONTINUE, true),
+  $("cyclone_override", OVERRIDE, false),
+  $("datatype", DATATYPE, false),
+  $("default", DEFAULT, true),
+  $("do", DO, true),
+  $("double", DOUBLE, true),
+  $("else", ELSE, true),
+  $("enum", ENUM, true),
+  $("export", EXPORT, false),
+  $("hide", HIDE, false),
+  $("__extension__", EXTENSION, true),
+  $("extern", EXTERN, true),
+  $("fallthru", FALLTHRU, false),
+  $("float", FLOAT, true),
+  $("for", FOR, true),
+  $("goto", GOTO, true),
+  $("if", IF, true),
+  $("inline", INLINE, true),
+  $("__inline__", INLINE, true),
+  $("__inline", INLINE, true),
+  $("int", INT, true),
+  $("let", LET, false),
+  $("long", LONG, true),
+  $("malloc", MALLOC, false),
+  $("namespace", NAMESPACE, false),
+  $("new", NEW, false),
+  $("NULL", NULL_kw, false),
+  $("numelts", NUMELTS, false),
+  $("offsetof", OFFSETOF, true),
+  $("__cyclone_port_on__", PORTON, false),
+  $("__cyclone_port_off__", PORTOFF, false),
+  $("__cyclone_pragma__", PRAGMA, false),
+  $("rcalloc", RCALLOC, false),
+  $("region_t", REGION_T, false),
+  $("region", REGION, false),
+  $("regions", REGIONS, false),
+  $("register", REGISTER, true),
+  $("restrict", RESTRICT, true),
+  $("return", RETURN, true),
+  $("rmalloc", RMALLOC, false),
+  $("rmalloc_inline", RMALLOC_INLINE, false),
+  $("rnew", RNEW, false),
+  $("short", SHORT, true),
+  $("signed", SIGNED, true),
+  $("__signed__", SIGNED, true),
+  $("sizeof", SIZEOF, true),
+  $("static", STATIC, true),
+  $("struct", STRUCT, true),
+  $("switch", SWITCH, true),
+  $("tagcheck", TAGCHECK, false),
+  $("tag_t", TAG_T, false),
+  $("__tempest_on__", TEMPESTON, false),
+  $("__tempest_off__", TEMPESTOFF, false),
+  $("throw", THROW, false),
+  $("try", TRY, false),
+  $("typedef", TYPEDEF, true),
+  $("typeof", TYPEOF, true),
+  $("__typeof__", TYPEOF, true),
+  $("union", UNION, true),
+  $("unsigned", UNSIGNED, true),
+  $("__unsigned__", UNSIGNED, true),
+  $("using", USING, false),
+  $("valueof", VALUEOF, false),
+  $("valueof_t", VALUEOF_T, false),
+  $("void", VOID, true),
+  $("volatile", VOLATILE, true),
+  $("__volatile__", VOLATILE, true),
+  $("asm", ASM_TOK, true),
+  $("__asm__", ASM_TOK, true),
+  $("while", WHILE, true),
+  $("spawn", SPAWN, false)
+};
+
+static int num_keywords(bool include_cyclone_keywords) {
+  int sum = 0;
+  for (unsigned i = 0; i < numelts(rw_array); i++)
+    if (include_cyclone_keywords || rw_array[i][2]) 
+      sum++;
+  return sum;
+}
+
+///////////////////////// Trie manipulation ///////////////////////
+static trie_t<`d> empty_trie(region_t<`d> d, int dummy) {
+  return rnew(d) Trie(Zero(),false);
+}
+
+static int trie_char(int c) {
+  // get the legal chars into a narrow range starting at 0
+  if(c >= 95) return c - 59;
+  else if(c > 64) return c - 55;
+  return c - 48;
+}
+
+static trie_t<`r> trie_lookup(region_t<`r> r, trie_t<`r> t, 
+                              string_t buff, int offset, unsigned len) {
+  unsigned i    = 0;
+  buff = buff + offset;
+  if(!(len < numelts(buff)))
+    Warn::impos("array bounds in trie_lookup");
+  while(i < len) {
+    switch(t->children) {
+    case {.Many = arr}:
+      // walk down one level
+      int ch = trie_char(buff[i]);
+      if(arr[ch] == NULL)
+	arr[ch] = rnew(r) Trie(Zero(),0);
+      t = arr[ch];
+      ++i;
+      break;
+    case {.One = $(one_ch, one_trie)}:
+      // walk down one level
+      if(one_ch == buff[i]) {
+	t = one_trie;
+      } else {
+	let arr = rnew(r) {for j < 64: NULL};
+	arr[trie_char(one_ch)] = one_trie;
+	let ch = trie_char(buff[i]);
+	arr[ch] = rnew(r) Trie(Zero(),0);
+	t->children = Many(arr); 
+	t = arr[ch];
+      }
+      ++i;
+      break;
+    case {.Zero = _}:
+      // new string -- extend the trie
+      while(i < len) {
+	let next = rnew(r) Trie(Zero(),0);
+	t->children = One(buff[i++], next);
+	t = next;
+      }
+      return t;
+    }
+  }
+  return t;
+}
+
+static int str_index_body(region_t<`d> d, 
+                          $(trie_t<`d>, Xarray::xarray_t<stringptr_t<`H>,`d>,
+                            string_t buff, int offset, int len)@ env) {
+  let $(tree,symbols,buff,offset,len) = *env;
+  let t = trie_lookup(d, tree, buff, offset, len);
+  // build string if necessary and return
+  if(t->shared_str == 0) {
+    let newstr = new_string(len+1);
+    zstrncpy((char ? @nozeroterm)newstr,buff+offset,len);
+    int ans = Xarray::add_ind(symbols, new ((string_t)newstr));
+    t->shared_str = ans;
+  }
+  return t->shared_str;
+}
+
+static int str_index(string_t buff, int offset, int len) {
+  dyn_trie_symbols_t idt = NULL;
+  idt :=: ids_trie;
+  let DynTrieSymbols{dyn,t,symbols} = *idt;
+  let env = $(t,symbols,buff,offset,len);
+  let res = open_region(dyn, &env, str_index_body);
+  *idt = DynTrieSymbols{dyn,t,symbols};
+  idt :=: ids_trie;
+  return res;
+}
+
+static int str_index_lbuf(Lexbuf<`a> lbuf) {
+  return str_index(lbuf->lex_buffer, 
+		   lbuf->lex_start_pos,
+		   lbuf->lex_curr_pos - lbuf->lex_start_pos);
+}
+
+static int insert_typedef_body(region_t<`d> h, $(trie_t<`d>, string_t s)@ arg)
+{
+  let $(t,s) = *arg;
+  let t_node = trie_lookup(h, t, s, 0, numelts(s)-1);
+  t_node->shared_str = true;
+  return 0;
+}
+
+
+static void insert_typedef(stringptr_t sptr) {
+  let s = *sptr;
+  dyn_trie_t tdefs = NULL;
+  tdefs :=: typedefs_trie;
+  let DynTrie{<`d> dyn, t} = *tdefs;
+  let env = $(t,s);
+  open_region(dyn, &env, insert_typedef_body);
+  *tdefs = DynTrie{dyn,t};
+  tdefs :=: typedefs_trie;
+  return;
+}
+
+static stringptr_t get_symbol_body(region_t<`d> dyn, $(trie_t<`d>,Xarray::xarray_t<stringptr_t<`H,`H>,`d>,int)@ env) {
+  let $(t,symbols,symbol_num) = *env;
+  return Xarray::get(symbols, symbol_num);
+}
+
+static stringptr_t get_symbol(int symbol_num) {
+  dyn_trie_symbols_t idt = NULL;
+  idt :=: ids_trie;
+  let DynTrieSymbols{dyn,t,symbols} = *idt;
+  let env = $(t,symbols,symbol_num);
+  let res = open_region(dyn, &env, get_symbol_body);
+  *idt = DynTrieSymbols{dyn,t,symbols};
+  idt :=: ids_trie;
+  return res;
+}
+
+// ************************ INTEGER CONSTANTS ************************
+
+  // String to integer conversions.  Core::int_of_string does not handle
+  // all of the cases we want: it does not handle a trailing 'u', 'U',
+  // 'l', or 'L'; and in particular, it does not treat '0'['0'-'7'] as
+  // an octal number.  
+
+  // copied from Core
+static int int_of_char(char c) {
+  if ('0'<=c && c<='9')      return c-'0';
+  else if ('a'<=c && c<='f') return 10+c-'a';
+  else if ('A'<=c && c<='F') return 10+c-'A';
+  else throw new Invalid_argument("string to integer conversion");
+}
+
+ 
+static cnst_t intconst(Lexbuf<`a> lbuf, int start, int end, int base) {
+  sign_t sn = None;
+  start += lbuf->lex_start_pos;
+  mstring_t    buff = lbuf->lex_buffer + start;
+  int          end2 = lbuf->lex_curr_pos - end;
+  int          len  = end2 - start;
+  size_of_t    size = Int_sz;
+  bool         declared_size = false;
+  cnst_t       res;
+  if (len >= 1 && (buff[len - 1] == 'l' || buff[len - 1] == 'L')) {
+    // size is at least long (default), but could be long long
+    len -= 1;
+    declared_size = true;
+    if (len >= 1 && (buff[len - 1] == 'l' || buff[len - 1] == 'L')) {
+      len -= 1;
+      size = LongLong_sz;
+    }
+  }
+  if (len >= 1 && (buff[len - 1] == 'u' || buff[len - 1] == 'U')) {
+    len -= 1;
+    sn = Unsigned;
+  }
+  if (sn == Unsigned) {
+    unsigned long long int n = 0;
+    for (int i = 0; i < len; i++)
+      n = n*base + (unsigned long long int)int_of_char(buff[i]);
+    if (n > ((unsigned long long int)0xffffffff)) {
+      if (declared_size && size == Int_sz) 
+        err("integer constant too large",lbuf);
+      size = LongLong_sz;
+    }
+    if (size == Int_sz) {
+      res = Cnst{.Int_c = $(sn,(unsigned int)n)};
+    } else {
+      res = Cnst{.LongLong_c = $(sn,n)};
+    }
+  } else {
+    long long int n = 0;
+    for (int i = 0; i < len; i++)
+      n = n*base + (long long int)int_of_char(buff[i]);
+    long long unsigned x = ((unsigned long long)n >> 32);
+    if (x != 0xffffffff && x != 0x00000000) {
+      if (declared_size && size == Int_sz)
+        err("integer constant too large",lbuf);
+      size = LongLong_sz;
+    }
+    if (size == Int_sz) {
+      res = Cnst{.Int_c = $(sn,(int)n)};
+    } else {
+      res = Cnst{.LongLong_c = $(sn,n)};
+    }
+  }
+  return res;
+}
+
+// ************************* STRING CONSTANTS *************************
+
+char string_buffer_v[]@zeroterm = {'x','x','x','x','x','x','x','x','x','x',0};
+mstring_t string_buffer = (mstring_t)string_buffer_v;
+int    string_pos    = 0;
+void store_string_char(char c) {
+  int sz = numelts(string_buffer) - 1;
+  if (string_pos >= sz) {
+    int newsz = sz;
+    while (string_pos >= newsz) newsz = newsz * 2;
+    mstring_t str = new {for i < newsz : (i < sz) ? string_buffer[i] : '\000'};
+    string_buffer = str;
+  }	
+  string_buffer[string_pos] = c;
+  ++string_pos;
+}
+void store_string(string_t s) {
+  int sz = strlen(s);
+  for (int i = 0; i < sz; i++)
+    store_string_char(s[i]);
+}
+mstring_t get_stored_string() {
+  mstring_t str = substring(string_buffer,0,string_pos);
+  string_pos = 0;
+  return str;
+} 
+
+// ******************* NAMESPACE, USING, AND TYPEDEF  *******************
+// FIX: As has been the case for years, any available typedef trumps
+//      a non-typedef, including typedefs in outer namespaces!!!
+// FIX: We also have never had good error locations for unbound namespaces.
+// FIX: If it were not for the tries, Binding would not have to leak so much
+//      about the representation of NSCtxt.
+
+static struct Ldecls {
+  Set::set_t<var_t> typedefs;
+};
+typedef struct Ldecls @ ldecls_t;
+
+static opt_t<Binding::nsctxt_t<ldecls_t>> lstate = NULL;
+
+static ldecls_t mk_empty_ldecls(bool ignore) {
+  return new Ldecls(Set::empty(zstrptrcmp));
+}
+
+static void typedef_init() {
+  lstate = new Opt(Binding::mt_nsctxt(true, mk_empty_ldecls));
+}
+
+static void recompute_typedefs() {
+  // Drop the old trie on the floor.
+  dyn_trie_t tdefs = NULL;
+  tdefs :=: typedefs_trie;
+  let DynTrie{dyn,t} = *tdefs;
+  free_ukey(dyn);
+  let NewDynamicRegion{<`d2> dyn2} = new_ukey();
+  trie_t<`d2> t2 = open_region(dyn2, 0, empty_trie);
+  *tdefs = DynTrie{dyn2, t2};
+  typedefs_trie :=: tdefs;
+
+  // accumulative, so no need to co curr_ns first
+  for(let as = lstate->v->availables; as != NULL; as = as->tl)
+    switch(as->hd) {
+    case &Binding::Using(ns): fallthru(ns);
+    case &Binding::Namespace(ns):
+      let ts = Dict::lookup(lstate->v->ns_data, ns);
+      Set::iter(insert_typedef,ts->typedefs);
+      break;
+    }
+}
+
+// This can stay the slow way because most identifiers are not qualified.
+// FIX: get a proper location!
+static bool is_typedef_in_namespace(List_t<var_t,`H> ns, var_t v) {
+  Binding::namespace_name_t ans = Binding::resolve_rel_ns(0, lstate->v, ns);
+  let ts = Dict::lookup(lstate->v->ns_data,ans);
+  return Set::member(ts->typedefs,v);
+}
+
+static bool is_typedef_body(region_t<`d> d, 
+                            $(List::list_t<var_t,`H>, trie_t<`d>, 
+                              string_t<`H>)@ env) {
+  let $(ns, t, s) = *env;
+  int len = numelts(s) - 1;
+  for(int i = 0; i < len; ++i)
+    switch (t->children) {
+    case {.Zero = _}: return false;
+    case {.One = $(one_ch, one_trie)} && one_ch != s[i]: return false;
+    case {.One = $(_,      one_trie)}: t = one_trie; break;
+    case {.Many = arr}:
+      let next = arr[trie_char(s[i])];
+      if(next == NULL)
+        return false;
+      t = next;
+      break;
+    }
+  return t->shared_str;
+}
+static bool is_typedef(List::list_t<var_t,`H> ns, var_t v) {
+  if (ns != NULL)
+    return is_typedef_in_namespace((List_t<var_t,`H>)ns,v);
+  // all unqualified typedefs must be in the trie 
+  // look ma -- fast lookup
+  let s   = *v;
+  dyn_trie_t tdefs = NULL;
+  tdefs :=: typedefs_trie;
+  let DynTrie{dyn,t} = *tdefs;
+  let env = $(ns, t, s);
+  let res = open_region(dyn, &env, is_typedef_body);
+  *tdefs = DynTrie{dyn,t};
+  tdefs :=: typedefs_trie;
+  return res;
+}
+
+void enter_namespace(var_t s) {
+  Binding::enter_ns(lstate->v, s, true, mk_empty_ldecls);
+  let ts = Dict::lookup(lstate->v->ns_data, lstate->v->curr_ns);
+  // some more typedefs may be visible
+  // recompute_typedefs(); // too slow! (does repeated work)
+  Set::iter(insert_typedef,ts->typedefs);
+}
+void leave_namespace() {
+  Binding::leave_ns(lstate->v);
+  recompute_typedefs();
+}
+void enter_using(qvar_t q) {
+  let ns = Binding::enter_using(0, lstate->v, q); // FIX: get a proper location!
+  let ts = Dict::lookup(lstate->v->ns_data, ns);
+  // some more typedefs may be visible
+  // recompute_typedefs(); // too slow! (does repeated work)
+  Set::iter(insert_typedef,ts->typedefs);
+}
+void leave_using() {
+  Binding::leave_using(lstate->v);
+  // some typedefs may no longer be visible
+  recompute_typedefs();
+}
+
+void register_typedef(qvar_t q) {
+  // FIX: we assume that q is not in fact qualified (always have)
+  let ts = Dict::lookup(lstate->v->ns_data, lstate->v->curr_ns);
+  ts->typedefs = Set::insert(ts->typedefs, (*q)[1]);
+
+  // FIX: We're really assuming it's unqualified here -- else need to
+  //      decide if the namespace-list is a visible one
+  insert_typedef((*q)[1]);
+}
+
+static short process_id(Lexbuf<`a> lbuf) {
+  int symbol_num = str_index_lbuf(lbuf);
+
+  // maybe it's a keyword
+  if(symbol_num <= num_kws) {
+    // check to see if we're parsing C or Cyclone
+    if (!in_extern_c || kw_nums[symbol_num-1].is_c_keyword) {
+      short res = (short)kw_nums[symbol_num-1].token_index; 
+      return res;
+    }
+  }
+
+  let s = get_symbol(symbol_num);
+  token_string = *s;
+
+  // maybe it's a typedef
+  if (is_typedef(NULL,s))
+    return TYPEDEF_NAME;
+
+  // alas, it's an identifier
+  return IDENTIFIER;
+}
+
+static short process_qual_id(Lexbuf<`a> lbuf) {
+  if(in_extern_c)
+    err("qualified identifiers not allowed in C code",lbuf);
+  int       i   = lbuf->lex_start_pos;
+  int       end = lbuf->lex_curr_pos;
+  mstring_t s   = lbuf->lex_buffer;
+
+  string_t<`H> *v = NULL;
+  list_t<var_t> rev_vs = NULL;
+
+  while (i<end) {
+    int start = i;
+    for (; i < end && s[i] != ':'; i++) 
+      ; // skip
+    if (start == i) // no progress -- first char is ':'
+      throw new Impossible("bad namespace");
+    int vlen = i - start;
+    if (v != NULL)
+      rev_vs = new List((var_t)v,rev_vs);
+    v = get_symbol(str_index(s, start, vlen));
+    i += 2;
+  }
+  if (v == NULL)
+    throw new Impossible("bad namespace");
+  list_t<var_t> vs = List::imp_rev(rev_vs);
+  // special cases:  when we have Cyc::Foo::bar or C::Foo::bar then
+  // we have absolute namespaces.
+  if (vs != NULL && strcmp(*vs->hd,"Cyc") == 0) {
+    vs = vs->tl;
+    token_qvar = new $(Abs_n(vs,false),(var_t)v);
+  }
+  else if (vs != NULL && strcmp(*vs->hd,"C") == 0) {
+    vs = vs->tl;
+    token_qvar = new $(Abs_n(vs,true),(var_t)v);
+  } else 
+    token_qvar = new $(Rel_n(vs),(var_t)v);
+  if (is_typedef(vs,(var_t)v))
+    return QUAL_TYPEDEF_NAME;
+  return QUAL_IDENTIFIER;
+}
+
+// Tracking source files and line numbers
+
+// One for each # nnn <file> that occurs in the source
+struct PosInfo<`r> {
+  struct PosInfo<`r>*`r next;  
+  unsigned int starting_line;           // nnn
+  const char ?`r filename;     // <file>
+  seg_t ?`U linenumpos;        // one entry for each line, holding seg_t
+  unsigned int linenumpos_offset; // next spot for inserting 
+};
+typedef struct PosInfo<`r>@`r pinfo_t<`r>;
+typedef struct PosInfo<`r>*`r pinfo_opt_t<`r>;
+// List of position info's in reverse order
+static pinfo_opt_t pos_info = NULL;
+// Current line number
+static int linenumber = 1;
+
+// when we see a new # nnn <file> directive, we create a new filepos entry
+static pinfo_t<`r> rnew_filepos(region_t<`r> r,
+                                const char ?`H filename, 
+                                unsigned int starting_line, 
+                                pinfo_opt_t<`r> next) {
+  seg_t ?`U linenumpos = rcalloc(unique_region, 10, sizeof(seg_t));
+  linenumpos[0] = yylloc.first_line;
+  return rnew(r) PosInfo{.next = next, .starting_line = starting_line,
+                         .filename = filename,
+                         .linenumpos = linenumpos,
+                         .linenumpos_offset = 1};
+}
+
+// when we see a newline, we add it into the current filepos entry
+static void inc_linenumber() {
+  if (pos_info == NULL) throw new Impossible("empty position info!");
+  pinfo_t p = (pinfo_t)pos_info;
+  seg_t ?`U linenums = NULL;
+  p->linenumpos :=: linenums;
+  unsigned offset = p->linenumpos_offset;
+  unsigned n = numelts(linenums);
+  // check for enough space to insert the position
+  if (offset >= n) {
+    // have to grow the array -- double it and copy over old array
+    seg_t ?`U newlinenums = rcalloc(unique_region,n*2,sizeof(seg_t));
+    for (unsigned i = 0; i < n; i++)
+      newlinenums[i] = linenums[i];
+    linenums :=: newlinenums;
+    // free old array of positions
+    ufree((_*)newlinenums);
+  }
+  // plug in the current position for this line number
+  linenums[offset] = yylloc.first_line;
+  p->linenumpos_offset = offset + 1;
+  linenumber++;
+  p->linenumpos :=: linenums;
+}
+
+// we've seen
+static void process_directive(char ?line) {
+  int i;
+  char buf[100];
+  const char ?filename = "";
+  if (sscanf(line, "# %d \"%s", &i, buf) == 2) {
+    if (compile_for_boot_r) {
+      // cut out the path from the filename so the repository does not
+      // have the names in it.  
+      int i = strlen(buf) - 1;
+      int last_slash = -1;
+      while (i >= 0) {
+        if (buf[i] == '/') { last_slash = i; break; };
+        --i;
+      }
+      filename = aprintf("\"%s",buf + last_slash + 1);
+    } else 
+      filename = aprintf("\"%s",buf);
+    if (linenumber == i && pos_info != NULL && strcmp(pos_info->filename,filename) == 0) return;
+    linenumber = i;
+  } else if (sscanf(line, "# %d", &i) == 1) {
+    if (linenumber == i) return;
+    linenumber = i;
+    if (pos_info != NULL) filename = pos_info->filename;
+  } else {
+    linenumber++; // we don't understand it, so skip over it
+    return;
+  }
+  pos_info = rnew_filepos(heap_region, filename, linenumber, pos_info);
+}
+
+// translate an absolute character offset to a file and line number given
+// position information.  If it's an invalid offset (e.g. 0) return $(NULL,0).
+$(const char ?, unsigned int) xlate_pos(seg_t char_offset) {
+  for (pinfo_opt_t p = pos_info; p != NULL; p = p->next) {
+    seg_t first_char_offset = p->linenumpos[0];
+    if (char_offset < first_char_offset && p->next != NULL) continue;
+    // we've found the right pinfo array, but we have to find the lineno now
+    // use a binary search...
+    unsigned int base = 0;
+    unsigned int size = p->linenumpos_offset;
+    while (size > 1) {
+      int half = size / 2;
+      int mid = base + half;
+      if (char_offset > p->linenumpos[mid]) {
+        base = base + half;
+        size = size - half;
+      } else {
+        size = half;
+      }
+    }
+    return $(p->filename, p->starting_line + base);
+  }
+  return $(NULL,0);
+}
+
+// Forward declarations of lexing functions 
+int token(Lexbuf);
+int scan_charconst(Lexbuf);
+int strng(Lexbuf);
+int strng_next(Lexbuf);
+int wstrng(Lexbuf);
+int wstrng_next(Lexbuf);
+int comment(Lexbuf);
+//int snarf_asm(Lexbuf);
+//int snarf_asm_body(Lexbuf);
+} // namespace Lex
+
+// for parser -- must not be prefixed
+int yylex(Lexing::Lexbuf<Lexing::Function_lexbuf_state<FILE@>> lbuf,
+          union YYSTYPE@ yylval, YYLTYPE @yyllocptr) { 
+ int ans = Lex::token(lbuf);
+ yylloc.first_line = yyllocptr->first_line = lexeme_start(lbuf);
+ yylloc.last_line  = yyllocptr->last_line  = lexeme_end(lbuf);
+ switch (ans) {
+ case TYPE_VAR: 
+ case WCHARACTER_CONSTANT:
+ case FLOATING_CONSTANT: 
+ case STRING: 
+ case WSTRING: 
+ case IDENTIFIER: 
+ case TYPEDEF_NAME: *yylval = YYSTYPE{.String_tok=Lex::token_string}; break;
+ case QUAL_IDENTIFIER: 
+ case QUAL_TYPEDEF_NAME:  *yylval = YYSTYPE{.QualId_tok=Lex::token_qvar}; break;
+ case INTEGER_CONSTANT:   *yylval = YYSTYPE{.Int_tok=Lex::token_int};     break;
+ case CHARACTER_CONSTANT: *yylval = YYSTYPE{.Char_tok=Lex::token_char};   break;
+// case ASM:                *yylval = YYSTYPE{.Asm_tok=Lex::token_asm};     break;
+ default: break;
+ }
+ return ans;
+} 
+
+namespace Lex;
+////////////////////////// LEXING RULES /////////////////////////////
+using Lexing {
+
+const int lex_base[] = {0,113,119,120,125,126,127,131,-6,4,12,2,-3,-1,-2,115,-4,121,-1,131,-5,209,217,240,272,132,-4,-3,-2,5,2,133,-17,138,-1,351,-18,6,-12,-11,280,-13,-10,-7,-8,-9,424,447,295,-14,154,-17,7,-1,-15,-16,8,-1,502,303,575,650,367,-16,-70,178,-50,9,2,-52,137,30,107,117,31,115,101,377,150,727,770,135,138,32,141,336,840,929,98,1004,1062,110,-69,-34,-40,1137,1212,-35,-53,-54,1287,103,1345,1420,1495,117,94,80,90,104,94,105,122,107,102,106,104,121,113,122,1570,129,130,126,1645,134,137,139,1730,137,137,126,139,134,151,138,1805,143,145,1890,173,174,176,179,163,1965,182,172,191,199,193,186,188,2050,214,214,205,235,2125,249,259,248,252,249,265,253,259,2210,253,264,266,2285,276,277,279,285,270,2370,275,2445,277,279,295,287,283,302,310,301,310,2530,295,299,323,320,2605,-15,-26,375,-38,-23,378,-25,-43,-37,-46,382,-47,2680,2709,518,-22,500,375,378,-21,370,737,2719,2749,2783,2823,502,380,2893,2931,724,429,430,422,432,-19,425,725,435,451,-20,443,726,454,456,-19,473,-51,453,-32,-50,10,396,2863,-45,-28,-30,-44,-27,-29,-31,1,2971,2,405,809,406,418,420,421,423,425,429,431,443,3044,3128,-67,-61,-60,-59,-58,-57,-56,-55,-62,-65,-66,831,445,-63,-64,-68,-39,-36,-33,582,-48,11,-24,570};
+const int lex_backtrk[] = {-1,-1,-1,-1,-1,-1,-1,6,-1,5,3,4,-1,-1,-1,2,-1,2,-1,5,-1,2,-1,2,2,2,-1,-1,-1,1,3,15,-1,15,-1,18,-1,1,-1,-1,13,-1,-1,-1,-1,-1,-1,14,13,-1,15,-1,1,-1,-1,-1,14,-1,17,12,-1,13,12,-1,-1,48,-1,49,69,-1,69,69,69,69,69,69,69,69,69,18,20,69,69,69,69,69,0,0,69,69,69,69,-1,-1,-1,2,0,-1,-1,-1,0,-1,-1,1,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,41,-1,-1,40,-1,-1,-1,-1,-1,-1,21,20,-1,-1,20,20,20,-1,20,-1,21,21,18,19,18,18,-1,17,17,17,17,17,18,-1,18,19,19,19,-1,19,18,18,18,-1,18,-1,-1,-1,-1,49,-1,21,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,47,-1,48};
+const int lex_default[] = {64,54,26,31,26,15,7,7,0,-1,-1,-1,0,0,0,25,0,25,0,-1,0,-1,-1,-1,-1,25,0,0,0,-1,-1,50,0,50,0,-1,0,-1,0,0,-1,0,0,0,0,0,-1,-1,-1,0,50,0,-1,0,0,0,-1,0,-1,-1,-1,-1,-1,0,0,-1,0,-1,-1,0,291,-1,-1,256,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,-1,-1,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,8,-1,-1,-1,39,-1,-1,-1,26,-1,-1,-1,-1,-1,-1,-1,49,-1,-1,45,-1,-1,-1,-1,-1,51,-1,-1,-1,-1,-1,-1,-1,42,-1,-1,-1,-1,41,-1,-1,-1,-1,-1,-1,-1,-1,43,-1,-1,-1,20,-1,-1,-1,-1,-1,63,-1,38,-1,-1,-1,-1,-1,-1,-1,-1,-1,44,-1,-1,-1,-1,195,0,0,-1,0,0,-1,0,0,0,0,-1,0,-1,-1,-1,0,-1,-1,-1,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,-1,-1,-1,-1,0,-1,-1,-1,-1,0,-1,0,243,0,0,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,0,0,0,0,-1,-1,0,0,0,0,0,0,291,0,-1,0,-1};
+const int lex_trans[] = {0,0,0,0,0,0,0,0,0,65,66,65,65,67,8,14,14,14,63,245,245,292,0,0,0,0,0,0,0,0,0,0,65,68,69,70,13,71,72,73,287,286,74,75,13,76,77,78,79,80,80,80,80,80,80,80,80,80,81,14,82,83,84,294,85,86,86,86,86,86,86,86,86,86,86,86,87,86,86,86,86,86,86,86,86,86,86,86,86,86,86,290,255,199,88,89,90,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,55,91,-1,56,-1,27,28,32,26,52,33,27,28,16,8,29,17,9,-1,-1,-1,-1,288,250,292,51,-1,293,27,57,53,34,-1,-1,27,253,97,18,102,251,252,-1,14,-1,-1,289,10,14,93,-1,-1,11,102,254,178,-1,21,21,21,21,21,21,21,21,295,-1,295,295,172,242,204,14,140,205,243,200,201,202,30,196,197,180,58,129,-1,114,257,295,244,35,-1,181,146,115,116,19,121,117,147,118,14,-1,-1,122,119,14,14,-1,120,125,14,94,123,124,126,127,128,130,14,137,132,133,14,-1,14,134,14,131,22,135,136,138,139,92,24,24,24,24,24,24,24,24,23,23,23,23,23,23,23,23,23,23,141,142,143,144,145,148,149,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,159,154,150,151,152,153,160,23,23,23,23,23,23,155,156,157,23,23,23,23,23,23,12,12,12,12,12,12,12,12,48,48,48,48,48,48,48,48,158,23,23,23,23,23,23,49,49,49,49,49,49,49,49,62,62,62,62,62,62,62,62,168,161,14,162,163,37,164,165,166,167,51,169,-1,170,-1,171,-1,36,-1,173,174,175,-1,20,12,176,38,177,-1,-1,-1,39,179,190,-1,-1,182,183,184,185,40,40,40,40,40,40,40,40,186,187,188,-1,189,191,192,41,41,41,41,41,41,41,41,41,247,193,248,248,248,248,248,248,248,248,248,248,194,198,106,107,203,206,108,249,42,285,281,109,110,12,26,111,213,112,20,214,214,229,280,113,279,278,8,277,245,276,43,246,44,275,45,274,46,47,47,47,47,47,47,47,47,47,47,273,213,282,0,214,214,229,47,47,47,47,47,47,47,47,47,47,47,47,47,47,47,47,227,36,36,230,0,230,234,47,47,47,47,47,47,0,0,0,47,47,47,47,47,47,235,235,0,239,0,240,0,0,0,39,227,36,36,230,42,230,234,47,47,47,47,47,47,59,59,59,59,59,59,59,59,240,235,235,216,239,216,240,38,217,217,217,217,217,217,217,217,217,217,215,0,231,295,0,295,295,0,0,214,0,230,0,0,240,0,292,0,45,293,0,0,0,14,12,0,295,0,26,0,0,0,215,0,231,0,20,0,0,0,8,214,43,230,44,0,60,61,61,61,61,61,61,61,61,61,61,0,0,0,0,0,0,0,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,0,0,0,0,0,0,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,0,-1,0,0,0,0,0,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,0,0,0,0,0,0,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,207,0,219,219,219,219,219,219,219,219,220,220,217,217,217,217,217,217,217,217,217,217,0,209,210,0,0,228,236,241,221,0,0,0,0,0,36,235,240,222,0,0,223,207,0,208,208,208,208,208,208,208,208,208,208,209,210,0,0,228,236,241,221,0,0,-1,209,210,36,235,240,222,0,211,223,282,0,0,0,0,0,0,212,0,283,283,283,283,283,283,283,283,0,0,0,0,0,282,209,210,0,0,0,0,0,211,284,284,284,284,284,284,284,284,212,100,100,100,100,100,100,100,100,100,100,101,0,0,0,0,0,0,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,0,0,0,100,0,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,98,0,0,0,0,99,0,0,0,0,0,0,0,0,100,100,100,100,100,100,100,100,100,100,101,0,0,0,0,0,0,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,0,0,0,100,0,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,96,96,96,96,96,96,96,96,96,96,0,0,0,0,0,0,0,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,0,0,0,0,96,0,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,0,0,0,0,95,0,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,0,0,0,0,0,0,0,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,0,0,0,0,95,0,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,96,96,96,96,96,96,96,96,96,96,0,0,0,0,0,0,0,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,0,0,0,0,96,0,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,100,100,100,100,100,100,100,100,100,100,101,0,0,0,0,0,0,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,0,0,0,0,100,0,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,0,0,0,0,104,0,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,105,0,0,0,0,0,0,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,0,0,0,0,103,0,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,104,104,104,104,104,104,104,104,104,104,0,0,0,0,0,0,0,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,0,0,0,0,104,0,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,218,218,218,218,218,218,218,218,218,218,0,0,0,0,0,0,0,0,0,0,0,209,210,0,0,0,0,207,210,208,208,208,208,208,208,208,208,208,208,217,217,217,217,217,217,217,217,217,217,0,209,210,0,209,210,0,0,211,-1,0,210,210,0,0,0,0,212,210,0,218,218,218,218,218,218,218,218,218,218,0,0,0,209,210,0,0,0,0,0,211,209,210,0,210,0,0,0,210,212,210,0,207,0,219,219,219,219,219,219,219,219,220,220,0,0,0,0,0,0,0,0,0,209,210,209,210,0,0,0,210,0,237,0,-1,0,0,0,0,0,0,238,207,0,220,220,220,220,220,220,220,220,220,220,0,0,0,209,210,0,0,0,0,0,237,209,210,0,0,0,0,0,232,238,0,0,0,0,0,0,0,233,0,0,248,248,248,248,248,248,248,248,248,248,0,0,0,209,210,0,0,0,0,0,232,209,210,0,0,0,0,0,210,233,224,224,224,224,224,224,224,224,224,224,0,0,0,0,0,0,0,224,224,224,224,224,224,209,210,0,0,0,0,0,210,0,0,0,0,0,0,0,224,224,224,224,224,224,224,224,224,224,0,224,224,224,224,224,224,224,224,224,224,224,224,0,0,0,258,0,225,0,0,259,0,0,0,0,0,226,0,0,260,260,260,260,260,260,260,260,0,224,224,224,224,224,224,261,0,0,0,0,225,0,0,0,0,0,0,0,0,226,0,0,0,0,0,0,0,0,0,0,0,0,0,0,262,0,0,0,0,263,264,0,0,0,265,0,0,0,0,0,0,0,266,0,0,0,267,0,268,0,269,0,270,271,271,271,271,271,271,271,271,271,271,0,0,0,0,0,0,0,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,0,0,0,0,0,0,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,272,0,0,0,0,0,0,0,0,271,271,271,271,271,271,271,271,271,271,0,0,0,0,0,0,0,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,0,0,0,0,0,0,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+const int lex_check[] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,0,9,29,37,52,56,67,246,293,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,30,0,0,0,256,258,0,0,11,0,0,0,0,0,0,0,0,0,0,0,0,0,0,10,0,0,0,68,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,71,74,83,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,15,1,73,2,2,3,17,2,3,4,4,5,6,4,5,6,7,25,31,7,72,76,70,33,15,70,2,1,2,3,17,73,4,75,88,5,101,76,76,50,19,25,31,72,6,19,91,33,7,6,105,75,107,7,19,19,19,19,19,19,19,19,65,50,65,65,108,78,81,19,110,81,78,82,82,82,4,84,84,106,1,111,15,113,73,65,78,3,17,106,109,114,115,5,112,116,109,117,19,25,31,112,118,19,19,33,119,121,19,91,122,123,125,126,127,129,19,130,131,132,19,50,19,133,19,129,19,134,135,137,138,0,21,21,21,21,21,21,21,21,22,22,22,22,22,22,22,22,22,22,140,141,142,143,144,147,147,22,22,22,22,22,22,23,23,23,23,23,23,23,23,23,23,146,148,149,150,151,152,146,23,23,23,23,23,23,154,155,156,22,22,22,22,22,22,24,24,24,24,24,24,24,24,40,40,40,40,40,40,40,40,157,23,23,23,23,23,23,48,48,48,48,48,48,48,48,59,59,59,59,59,59,59,59,159,160,35,161,162,35,163,164,165,166,1,168,15,169,73,170,2,3,17,172,173,174,4,5,6,175,35,176,7,25,31,35,178,180,70,33,181,182,183,184,35,35,35,35,35,35,35,35,185,186,187,50,188,190,191,35,62,62,62,62,62,62,62,62,77,192,77,77,77,77,77,77,77,77,77,77,193,197,85,85,200,205,85,247,35,259,261,85,85,35,35,85,212,85,35,213,215,222,262,85,263,264,35,265,243,266,35,243,35,267,35,268,35,46,46,46,46,46,46,46,46,46,46,269,212,284,-1,213,215,222,46,46,46,46,46,46,47,47,47,47,47,47,47,47,47,47,226,227,228,229,-1,231,233,47,47,47,47,47,47,-1,-1,-1,46,46,46,46,46,46,234,236,-1,238,-1,239,-1,-1,-1,58,226,227,228,229,58,231,233,47,47,47,47,47,47,58,58,58,58,58,58,58,58,241,234,236,209,238,209,239,58,209,209,209,209,209,209,209,209,209,209,211,-1,221,295,-1,295,295,-1,-1,211,-1,221,-1,-1,241,-1,291,-1,58,291,-1,-1,-1,58,58,-1,295,-1,58,-1,-1,-1,211,-1,221,-1,58,-1,-1,-1,58,211,58,221,58,-1,58,60,60,60,60,60,60,60,60,60,60,-1,-1,-1,-1,-1,-1,-1,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,-1,-1,-1,-1,-1,-1,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,61,61,61,61,61,61,61,61,61,61,-1,243,-1,-1,-1,-1,-1,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,-1,-1,-1,-1,-1,-1,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,61,79,-1,79,79,79,79,79,79,79,79,79,79,216,216,216,216,216,216,216,216,216,216,-1,79,79,-1,-1,225,232,237,79,-1,-1,-1,-1,-1,225,232,237,79,-1,-1,79,80,-1,80,80,80,80,80,80,80,80,80,80,79,79,-1,-1,225,232,237,79,-1,-1,291,80,80,225,232,237,79,-1,80,79,260,-1,-1,-1,-1,-1,-1,80,-1,260,260,260,260,260,260,260,260,-1,-1,-1,-1,-1,283,80,80,-1,-1,-1,-1,-1,80,283,283,283,283,283,283,283,283,80,86,86,86,86,86,86,86,86,86,86,86,-1,-1,-1,-1,-1,-1,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,-1,-1,-1,-1,86,-1,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,86,87,-1,-1,-1,-1,87,-1,-1,-1,-1,-1,-1,-1,-1,87,87,87,87,87,87,87,87,87,87,87,-1,-1,-1,-1,-1,-1,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,-1,-1,-1,-1,87,-1,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,87,89,89,89,89,89,89,89,89,89,89,-1,-1,-1,-1,-1,-1,-1,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,-1,-1,-1,-1,89,-1,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,89,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,-1,-1,-1,-1,90,-1,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,90,95,95,95,95,95,95,95,95,95,95,-1,-1,-1,-1,-1,-1,-1,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,-1,-1,-1,-1,95,-1,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,95,96,96,96,96,96,96,96,96,96,96,-1,-1,-1,-1,-1,-1,-1,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,-1,-1,-1,-1,96,-1,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,96,100,100,100,100,100,100,100,100,100,100,100,-1,-1,-1,-1,-1,-1,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,-1,-1,-1,-1,100,-1,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,100,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,-1,-1,-1,-1,102,-1,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,102,103,103,103,103,103,103,103,103,103,103,103,-1,-1,-1,-1,-1,-1,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,-1,-1,-1,-1,103,-1,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,103,104,104,104,104,104,104,104,104,104,104,-1,-1,-1,-1,-1,-1,-1,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,-1,-1,-1,-1,104,-1,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,104,120,120,120,120,120,120,120,120,120,120,-1,-1,-1,-1,-1,-1,-1,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,-1,-1,-1,-1,120,-1,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,124,124,124,124,124,124,124,124,124,124,-1,-1,-1,-1,-1,-1,-1,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,-1,-1,-1,-1,124,-1,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,124,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,128,128,128,128,128,128,128,128,128,128,-1,-1,-1,-1,-1,-1,-1,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,-1,-1,-1,-1,128,120,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,128,136,136,136,136,136,136,136,136,136,136,-1,-1,-1,-1,-1,-1,-1,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,-1,-1,-1,-1,136,124,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,136,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,139,139,139,139,139,139,139,139,139,139,-1,-1,-1,-1,-1,-1,-1,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,-1,-1,-1,-1,139,128,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,145,145,145,145,145,145,145,145,145,145,-1,-1,-1,-1,-1,-1,-1,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,-1,-1,-1,-1,145,136,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,145,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,153,153,153,153,153,153,153,153,153,153,-1,-1,-1,-1,-1,-1,-1,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,-1,-1,-1,-1,153,139,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,153,158,158,158,158,158,158,158,158,158,158,-1,-1,-1,-1,-1,-1,-1,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,-1,-1,-1,-1,158,145,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,158,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,167,167,167,167,167,167,167,167,167,167,-1,-1,-1,-1,-1,-1,-1,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,-1,-1,-1,-1,167,153,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,167,171,171,171,171,171,171,171,171,171,171,-1,-1,-1,-1,-1,-1,-1,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,-1,-1,-1,-1,171,158,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,177,177,177,177,177,177,177,177,177,177,-1,-1,-1,-1,-1,-1,-1,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,-1,-1,-1,-1,177,167,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,177,179,179,179,179,179,179,179,179,179,179,-1,-1,-1,-1,-1,-1,-1,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,-1,-1,-1,-1,179,171,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,179,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,189,189,189,189,189,189,189,189,189,189,-1,-1,-1,-1,-1,-1,-1,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,-1,-1,-1,-1,189,177,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,189,194,194,194,194,194,194,194,194,194,194,-1,-1,-1,-1,-1,-1,-1,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,-1,-1,-1,-1,194,179,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,194,207,207,207,207,207,207,207,207,207,207,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,207,207,-1,-1,-1,-1,208,207,208,208,208,208,208,208,208,208,208,208,217,217,217,217,217,217,217,217,217,217,-1,208,208,-1,207,207,-1,-1,208,189,-1,207,217,-1,-1,-1,-1,208,217,-1,218,218,218,218,218,218,218,218,218,218,-1,-1,-1,208,208,-1,-1,-1,-1,-1,208,218,218,-1,217,-1,-1,-1,218,208,217,-1,219,-1,219,219,219,219,219,219,219,219,219,219,-1,-1,-1,-1,-1,-1,-1,-1,-1,218,218,219,219,-1,-1,-1,218,-1,219,-1,194,-1,-1,-1,-1,-1,-1,219,220,-1,220,220,220,220,220,220,220,220,220,220,-1,-1,-1,219,219,-1,-1,-1,-1,-1,219,220,220,-1,-1,-1,-1,-1,220,219,-1,-1,-1,-1,-1,-1,-1,220,-1,-1,248,248,248,248,248,248,248,248,248,248,-1,-1,-1,220,220,-1,-1,-1,-1,-1,220,248,248,-1,-1,-1,-1,-1,248,220,223,223,223,223,223,223,223,223,223,223,-1,-1,-1,-1,-1,-1,-1,223,223,223,223,223,223,248,248,-1,-1,-1,-1,-1,248,-1,-1,-1,-1,-1,-1,-1,224,224,224,224,224,224,224,224,224,224,-1,223,223,223,223,223,223,224,224,224,224,224,224,-1,-1,-1,257,-1,224,-1,-1,257,-1,-1,-1,-1,-1,224,-1,-1,257,257,257,257,257,257,257,257,-1,224,224,224,224,224,224,257,-1,-1,-1,-1,224,-1,-1,-1,-1,-1,-1,-1,-1,224,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,257,-1,-1,-1,-1,257,257,-1,-1,-1,257,-1,-1,-1,-1,-1,-1,-1,257,-1,-1,-1,257,-1,257,-1,257,-1,257,270,270,270,270,270,270,270,270,270,270,-1,-1,-1,-1,-1,-1,-1,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,-1,-1,-1,-1,-1,-1,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,270,271,-1,-1,-1,-1,-1,-1,-1,-1,271,271,271,271,271,271,271,271,271,271,-1,-1,-1,-1,-1,-1,-1,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,-1,-1,-1,-1,-1,-1,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,271,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+     int lex_engine(int start_state, Lexbuf<`a> lbuf) {
+
+       int state, base, backtrk;
+       int c;
+       state = start_state;
+
+       if (state >= 0) {
+	 lbuf->lex_last_pos = lbuf->lex_start_pos = lbuf->lex_curr_pos;
+	 lbuf->lex_last_action = -1;
+       } else {
+	 state = -state-1;
+       }
+       while (true) {
+	 base = lex_base[state];
+	 if (base < 0) return -base-1;
+	 backtrk = lex_backtrk[state];
+	 if (backtrk >= 0) {
+	   lbuf->lex_last_pos    = lbuf->lex_curr_pos;
+	   lbuf->lex_last_action = backtrk;
+	 }
+	 if (lbuf->lex_curr_pos >= lbuf->lex_buffer_len) {
+	   if (!lbuf->lex_eof_reached)
+	     return -state-1;
+	   else
+	     c = 256;
+	 } else {
+	   c = (int) (lbuf->lex_buffer[lbuf->lex_curr_pos++]);
+	   if (c==EOF) c=256;
+	 }
+	 if (lex_check[base+c]==state)
+	   state = lex_trans[base+c];
+	 else
+	   state = lex_default[state];
+	 if (state < 0) {
+	   lbuf->lex_curr_pos = lbuf->lex_last_pos;
+	   if (lbuf->lex_last_action == -1)
+	     throw new Error("empty token");
+	   else {
+	     return lbuf->lex_last_action;
+	   }
+	 } else {
+	   if (c == 256) lbuf->lex_eof_reached = false;
+	 }
+       }
+  }
+int token_rec(Lexbuf<`a> lexbuf, int lexstate) {
+  lexstate = lex_engine(lexstate,lexbuf);
+  switch (lexstate) {
+
+case 0: 
+#line 801 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                                            return process_id(lexbuf); 
+case 1: 
+#line 804 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+     return process_qual_id(lexbuf); 
+case 2: 
+#line 807 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+     token_string = *(get_symbol(str_index_lbuf(lexbuf))); 
+     return TYPE_VAR; 
+case 3: 
+#line 814 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return TAGGED_QUAL; 
+case 4: 
+#line 815 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return NOTNULL_QUAL; 
+case 5: 
+#line 816 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return ZEROTERM_QUAL; 
+case 6: 
+#line 817 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return NOZEROTERM_QUAL; 
+case 7: 
+#line 818 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return EXTENSIBLE_QUAL; 
+case 8: 
+#line 819 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return REGION_QUAL; 
+case 9: 
+#line 820 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return NUMELTS_QUAL; 
+case 10: 
+#line 821 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return THIN_QUAL; 
+case 11: 
+#line 822 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return FAT_QUAL; 
+case 12: 
+#line 823 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return NULLABLE_QUAL; 
+case 13: 
+#line 824 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return REQUIRES_QUAL; 
+case 14: 
+#line 825 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return ENSURES_QUAL; 
+case 15: 
+#line 826 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return IEFFECT_QUAL; 
+case 16: 
+#line 827 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                            --lexbuf->lex_curr_pos; return OEFFECT_QUAL; 
+case 17: 
+#line 831 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+        token_int = intconst(lexbuf,2,0,16);
+        return INTEGER_CONSTANT; 
+case 18: 
+#line 834 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+        token_int = intconst(lexbuf,0,0,8);
+        return INTEGER_CONSTANT; 
+case 19: 
+#line 840 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+        token_int = intconst(lexbuf,0,0,10);
+        return INTEGER_CONSTANT; 
+case 20: 
+#line 843 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+        token_int = intconst(lexbuf,0,0,10);
+        return INTEGER_CONSTANT; 
+case 21: 
+#line 848 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+        token_string = lexeme(lexbuf);
+        return FLOATING_CONSTANT; 
+case 22: 
+#line 851 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  EQ_OP; 
+case 23: 
+#line 852 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  NE_OP; 
+case 24: 
+#line 853 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  LE_OP; 
+case 25: 
+#line 854 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  GE_OP; 
+case 26: 
+#line 855 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  INC_OP; 
+case 27: 
+#line 856 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  DEC_OP; 
+case 28: 
+#line 857 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  ADD_ASSIGN; 
+case 29: 
+#line 858 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  SUB_ASSIGN; 
+case 30: 
+#line 859 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  MUL_ASSIGN; 
+case 31: 
+#line 860 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  DIV_ASSIGN; 
+case 32: 
+#line 861 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+           return  MOD_ASSIGN; 
+case 33: 
+#line 862 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+           return  OR_ASSIGN; 
+case 34: 
+#line 863 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+           return  XOR_ASSIGN; 
+case 35: 
+#line 864 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+           return  AND_ASSIGN; 
+case 36: 
+#line 865 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+           return  LEFT_ASSIGN; 
+case 37: 
+#line 866 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+           return  RIGHT_ASSIGN; 
+case 38: 
+#line 867 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  AND_OP; 
+case 39: 
+#line 868 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  OR_OP; 
+case 40: 
+#line 869 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  LEFT_OP; 
+case 41: 
+#line 871 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  RIGHT_OP; 
+case 42: 
+#line 872 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return  LEFT_RIGHT; 
+case 43: 
+#line 873 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return PTR_OP; 
+case 44: 
+#line 874 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+          return ELLIPSIS; 
+case 45: 
+#line 875 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return COLON_COLON; 
+case 46: 
+#line 877 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+          return SWAP; 
+case 47: 
+#line 880 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+    process_directive(lexeme(lexbuf)); return token(lexbuf); 
+case 48: 
+#line 881 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                          return token(lexbuf); 
+case 49: 
+#line 882 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                                inc_linenumber(); return token(lexbuf); 
+case 50: 
+#line 883 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+          comment_depth = 1; 
+	  runaway_start = lexeme_start(lexbuf); 
+	  comment(lexbuf); 
+	  return token(lexbuf); 
+case 51: 
+#line 889 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+    string_pos = 0; 
+    runaway_start = lexeme_start(lexbuf);
+    while (strng(lexbuf))
+      /* skip */;
+    token_string = get_stored_string();
+    return STRING; 
+case 52: 
+#line 897 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+    string_pos = 0; 
+    runaway_start = lexeme_start(lexbuf);
+    while (wstrng(lexbuf))
+      /* skip */;
+    token_string = get_stored_string();
+    return WSTRING; 
+case 53: 
+#line 905 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+    string_pos = 0; 
+    runaway_start = lexeme_start(lexbuf);
+    while (scan_charconst(lexbuf))
+      /* skip */;
+    token_string = get_stored_string();
+    return WCHARACTER_CONSTANT; 
+case 54: 
+#line 912 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\a'; return CHARACTER_CONSTANT; 
+case 55: 
+#line 913 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\b'; return CHARACTER_CONSTANT; 
+case 56: 
+#line 914 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\f'; return CHARACTER_CONSTANT; 
+case 57: 
+#line 915 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\n'; return CHARACTER_CONSTANT; 
+case 58: 
+#line 916 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\r'; return CHARACTER_CONSTANT; 
+case 59: 
+#line 917 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\t'; return CHARACTER_CONSTANT; 
+case 60: 
+#line 918 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\v'; return CHARACTER_CONSTANT; 
+case 61: 
+#line 919 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\\'; return CHARACTER_CONSTANT; 
+case 62: 
+#line 920 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '\''; return CHARACTER_CONSTANT; 
+case 63: 
+#line 921 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '"';  return CHARACTER_CONSTANT; 
+case 64: 
+#line 922 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = '?';  return CHARACTER_CONSTANT; 
+case 65: 
+#line 925 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = cnst2char(intconst(lexbuf,2,1,8),lexbuf);
+              return CHARACTER_CONSTANT;
+            
+case 66: 
+#line 930 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              token_char = cnst2char(intconst(lexbuf,3,1,16),lexbuf);
+              return CHARACTER_CONSTANT;
+            
+case 67: 
+#line 934 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+      token_char = lexeme_char(lexbuf,1);
+      return CHARACTER_CONSTANT;
+    
+case 68: 
+#line 938 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+        return -1; 
+case 69: 
+#line 940 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+        return (int)(lexeme_char(lexbuf,0));  default:
+   lexbuf->refill_buff(lexbuf);
+   return token_rec(lexbuf, lexstate);
+  }
+ throw new Error("some action didn't return!");
+}
+int token(Lexbuf<`a> lexbuf) { return token_rec(lexbuf,0); }
+int scan_charconst_rec(Lexbuf<`a> lexbuf, int lexstate) {
+  lexstate = lex_engine(lexstate,lexbuf);
+  switch (lexstate) {
+
+case 0: 
+#line 943 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              return 0; 
+case 1: 
+#line 945 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\a'); return 1; 
+case 2: 
+#line 946 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\b'); return 1; 
+case 3: 
+#line 947 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\f'); return 1; 
+case 4: 
+#line 948 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\n'); return 1; 
+case 5: 
+#line 949 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\r'); return 1; 
+case 6: 
+#line 950 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\t'); return 1; 
+case 7: 
+#line 951 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\v'); return 1; 
+case 8: 
+#line 952 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\\'); return 1; 
+case 9: 
+#line 953 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('\''); return 1; 
+case 10: 
+#line 954 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('"');  return 1; 
+case 11: 
+#line 955 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char('?');  return 1; 
+case 12: 
+#line 958 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string(lexeme(lexbuf)); return 1; 
+case 13: 
+#line 961 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string(lexeme(lexbuf)); return 1; 
+case 14: 
+#line 963 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             store_string_char(lexeme_char(lexbuf,0)); return 1; 
+case 15: 
+#line 965 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             inc_linenumber(); runaway_err("wide character ends in newline",lexbuf); return 0; 
+case 16: 
+#line 966 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             runaway_err("unterminated wide character",lexbuf); return 0; 
+case 17: 
+#line 967 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+             err("bad character following backslash in wide character",lexbuf); return 1;  default:
+   lexbuf->refill_buff(lexbuf);
+   return scan_charconst_rec(lexbuf, lexstate);
+  }
+ throw new Error("some action didn't return!");
+}
+int scan_charconst(Lexbuf<`a> lexbuf) { return scan_charconst_rec(lexbuf,1); }
+int strng_next_rec(Lexbuf<`a> lexbuf, int lexstate) {
+  lexstate = lex_engine(lexstate,lexbuf);
+  switch (lexstate) {
+
+case 0: 
+#line 972 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+         return 1; 
+case 1: 
+#line 973 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+            inc_linenumber(); return strng_next(lexbuf); 
+case 2: 
+#line 974 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+               return strng_next(lexbuf); 
+case 3: 
+#line 976 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+      /* backup */ lexbuf->lex_curr_pos -= 1; return 0;  default:
+   lexbuf->refill_buff(lexbuf);
+   return strng_next_rec(lexbuf, lexstate);
+  }
+ throw new Error("some action didn't return!");
+}
+int strng_next(Lexbuf<`a> lexbuf) { return strng_next_rec(lexbuf,2); }
+int strng_rec(Lexbuf<`a> lexbuf, int lexstate) {
+  lexstate = lex_engine(lexstate,lexbuf);
+  switch (lexstate) {
+
+case 0: 
+#line 980 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      return strng_next(lexbuf); 
+case 1: 
+#line 981 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      inc_linenumber(); return 1; 
+case 2: 
+#line 982 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('\a'); return 1; 
+case 3: 
+#line 983 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('\b'); return 1; 
+case 4: 
+#line 984 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('\f'); return 1; 
+case 5: 
+#line 985 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      if (expand_specials) {
+                        store_string_char('\\');
+                        store_string_char('n'); 
+                      } else
+                        store_string_char('\n'); 
+                      return 1; 
+                    
+case 6: 
+#line 992 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('\r'); return 1; 
+case 7: 
+#line 993 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      if (expand_specials) {
+                        store_string_char('\\');
+                        store_string_char('t'); 
+                      } else
+                        store_string_char('\t'); 
+                      return 1; 
+case 8: 
+#line 999 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('\v'); return 1; 
+case 9: 
+#line 1000 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('\\'); return 1; 
+case 10: 
+#line 1001 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('\''); return 1; 
+case 11: 
+#line 1002 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('"');  return 1; 
+case 12: 
+#line 1003 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('?');  return 1; 
+case 13: 
+#line 1006 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+              store_string_char(cnst2char(intconst(lexbuf,1,0,8),lexbuf));
+              return 1;
+            
+case 14: 
+#line 1011 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char(cnst2char(intconst(lexbuf,2,0,16),lexbuf));
+                      return 1;
+                    
+case 15: 
+#line 1015 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string(lexeme(lexbuf));
+		      return 1; 
+case 16: 
+#line 1017 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      inc_linenumber(); 
+                      runaway_err("string ends in newline",lexbuf);
+                      return 0;
+                    
+case 17: 
+#line 1021 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      runaway_err("unterminated string",lexbuf);
+                      return 0;
+                    
+case 18: 
+#line 1024 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      err("bad character following backslash in string",lexbuf);
+		      return 1;  default:
+   lexbuf->refill_buff(lexbuf);
+   return strng_rec(lexbuf, lexstate);
+  }
+ throw new Error("some action didn't return!");
+}
+int strng(Lexbuf<`a> lexbuf) { return strng_rec(lexbuf,3); }
+int wstrng_next_rec(Lexbuf<`a> lexbuf, int lexstate) {
+  lexstate = lex_engine(lexstate,lexbuf);
+  switch (lexstate) {
+
+case 0: 
+#line 1034 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+          store_string("\" L\""); return 1; 
+case 1: 
+#line 1035 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+            inc_linenumber(); return wstrng_next(lexbuf); 
+case 2: 
+#line 1036 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+               return wstrng_next(lexbuf); 
+case 3: 
+#line 1038 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+      /* backup */ lexbuf->lex_curr_pos -= 1; return 0;  default:
+   lexbuf->refill_buff(lexbuf);
+   return wstrng_next_rec(lexbuf, lexstate);
+  }
+ throw new Error("some action didn't return!");
+}
+int wstrng_next(Lexbuf<`a> lexbuf) { return wstrng_next_rec(lexbuf,4); }
+int wstrng_rec(Lexbuf<`a> lexbuf, int lexstate) {
+  lexstate = lex_engine(lexstate,lexbuf);
+  switch (lexstate) {
+
+case 0: 
+#line 1041 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      return wstrng_next(lexbuf); 
+case 1: 
+#line 1043 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string_char('\\'); 
+		      store_string_char(lexeme_char(lexbuf,1)); 
+		      return 1; 
+case 2: 
+#line 1049 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      store_string(lexeme(lexbuf));
+                      return 1; 
+case 3: 
+#line 1051 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      inc_linenumber();
+                      runaway_err("string ends in newline",lexbuf);
+                      return 0; 
+case 4: 
+#line 1054 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      runaway_err("unterminated string",lexbuf);
+                      return 0; 
+case 5: 
+#line 1056 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      err("bad character following backslash in string",lexbuf);
+		      return 1;  default:
+   lexbuf->refill_buff(lexbuf);
+   return wstrng_rec(lexbuf, lexstate);
+  }
+ throw new Error("some action didn't return!");
+}
+int wstrng(Lexbuf<`a> lexbuf) { return wstrng_rec(lexbuf,5); }
+int comment_rec(Lexbuf<`a> lexbuf, int lexstate) {
+  lexstate = lex_engine(lexstate,lexbuf);
+  switch (lexstate) {
+
+case 0: 
+#line 1059 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      ++comment_depth; return comment(lexbuf); 
+case 1: 
+#line 1060 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      --comment_depth; 
+		      if (comment_depth > 0) 
+			return comment(lexbuf);
+		      return 0; /* return value ignored */
+		    
+case 2: 
+#line 1065 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      runaway_err("unterminated comment",lexbuf);
+                      return 0; /* return value ignored */ 
+                    
+case 3: 
+#line 1068 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      return comment(lexbuf); 
+case 4: 
+#line 1069 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      return comment(lexbuf); 
+case 5: 
+#line 1070 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                      inc_linenumber(); return comment(lexbuf); 
+case 6: 
+#line 1071 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+                             return comment(lexbuf);  default:
+   lexbuf->refill_buff(lexbuf);
+   return comment_rec(lexbuf, lexstate);
+  }
+ throw new Error("some action didn't return!");
+}
+int comment(Lexbuf<`a> lexbuf) { return comment_rec(lexbuf,6); }
+
+}
+#line 1077 "/home/pgerakios/reglock/branches/cyclone/0.8.3/src/lex.cyl"
+ 
+
+// reset the position information -- this is done separately 
+// because lex_init() gets called as soon as we're done lexing
+// to free up its other data structures.  We need to hang on to
+// the position information so that if we dump, it's there.
+void pos_init() {
+  linenumber = 1;
+  pos_info = NULL;
+}
+
+static Xarray::xarray_t<stringptr_t,`d> empty_xarray(region_t<`d> id_rgn, int dummy) {
+  Xarray::xarray_t<stringptr_t,`d> symbols = 
+    Xarray::rcreate(id_rgn,101,new ((string_t)""));
+  // don't use first entry b/c 0 means "not a symbol"
+  Xarray::add(symbols, &bogus_string);
+  return symbols;
+} 
+
+void lex_init(bool include_cyclone_keywords) {
+  // reset the in_extern_c stuff
+  in_extern_c = false;
+  list_t<bool,`U> x = NULL;
+  prev_extern_c :=: x;
+  while (x != NULL) {
+    list_t<bool,`U> t = x->tl;
+    ufree(x);
+    x = t;
+  }
+  // free any dynamic regions allocated first
+  if (ids_trie != NULL) {
+    dyn_trie_symbols_t idt = NULL;
+    idt :=: ids_trie;
+    let DynTrieSymbols{dyn,...} = *idt;
+    free_ukey(dyn);
+    ufree(idt);
+  }
+  if (typedefs_trie != NULL) {
+    dyn_trie_t tdefs = NULL;
+    tdefs :=: typedefs_trie;
+    let DynTrie{dyn,...} = *tdefs;
+    free_ukey(dyn);
+    ufree(tdefs);
+  }
+  // Now allocate dynamic regions for the tries
+  let NewDynamicRegion{id_dyn} = new_ukey();
+  let ts = open_region(id_dyn, 0, empty_trie);
+  let xa = open_region(id_dyn, 0, empty_xarray);
+  ids_trie = unew DynTrieSymbols{id_dyn, ts, xa};
+
+  let NewDynamicRegion{typedefs_dyn} = new_ukey();
+  trie_t t = open_region(typedefs_dyn, 0, empty_trie);
+  typedefs_trie = unew DynTrie{typedefs_dyn, t};
+  num_kws       = num_keywords(include_cyclone_keywords);
+  kw_nums       = new {for i < num_kws : KeyWordInfo{0,0}};
+  unsigned i = 0;
+  unsigned rwsze = numelts(rw_array);
+  for (unsigned j = 0; j < rwsze; j++) {
+    if (include_cyclone_keywords || rw_array[j][2]) {
+      let str = rw_array[j][0];
+      str_index(str, 0, strlen(str));
+      kw_nums[i] = KeyWordInfo{rw_array[j][1],rw_array[j][2]};
+      i++;
+    }
+  }
+  typedef_init();
+  comment_depth = 0;
+}
+

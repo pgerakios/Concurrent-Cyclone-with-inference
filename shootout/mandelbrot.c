@@ -1,0 +1,1 @@
+mandelbrot_simpler.c

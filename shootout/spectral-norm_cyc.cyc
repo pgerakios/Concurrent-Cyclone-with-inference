@@ -1,0 +1,307 @@
+#ifndef C_STUB
+#ifndef CYC_SPECTRAL_THREADS
+#define CYC_SPECTRAL_THREADS 4
+#endif
+
+#define xinc(x)  cap (x,1,0,0) 
+#define xdec(x)  cap (x,-1,0,0) 
+#define xlinc(x) cap (x,0,1,0)  
+#define xldec(x) cap (x,0,-1,0) 
+
+#define xrlinc(x) cap (x,0,0,1)  
+#define xrldec(x) cap (x,0,0,-1)  
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <core.h>
+#include <math.h>
+
+namespace Core {
+  int tid() @nothrow @re_entrant;
+  void flush() @nothrow @re_entrant;
+  void main_join() @nothrow; // not re-entrant because it 
+}
+
+extern "C" int atoi(const char @);
+extern void barrier(int threads) @nothrow;
+
+/* parameter for evaluate functions */
+struct Param<`r0::X,`r1::X,`r2::X,`r3::X>
+{
+#define QUALI(r,i) @notnull @numelts(i) `r
+#define QUAL(r) QUALI(r,valueof(`i)) 
+    <`i::I>               // there exists some unsigned integer i
+
+    double * QUAL(r0)   u;          /* source vector */
+    double * QUAL(r1)   tmp;        /* temporary */
+    double * QUAL(r2)   v;          /* destination vector */
+
+    tag_t<`i> N;       // /* source/destination vector length */
+    int N2;             /* = N/2 */
+
+    int r_begin;        /* working range of each thread */
+    int r_end;
+
+	 double @`r3 vv;
+	 double @`r3 vBv;	
+	 region_t<`r0> 	r0;
+	 region_t<`r1> 	r1;
+	 region_t<`r2> 	r2;
+	 region_t<`r3> 	r3;
+};
+
+/* Return: 1.0 / (i + j) * (i + j +1) / 2 + i + 1; */
+static double
+eval_A(int i, int j)
+{
+    /*
+     * 1.0 / (i + j) * (i + j +1) / 2 + i + 1;
+     * n * (n+1) is even number. Therefore, just (>> 1) for (/2)
+     */
+    int d = (((i+j) * (i+j+1)) >> 1) + i+1;
+
+    return 1.0 / (double) d;
+}
+
+/* This function is called by many threads */
+//READ U, WRITE TMP, 
+
+// no read/write access for tmp, 
+// read-only access for u,
+// no read/write access for v 
+static void eval_A_times_u(struct Param<`r0::X,`r1::X,`r2::X,`r3::X> @ p)
+@xrgn
+@nothrow
+{
+    /* alias of source vector */
+    int          i,k;
+    int          ie;
+
+    let &Param{<`i> 
+						.u = u,
+						.tmp=tmp,
+					 	.v = v,
+						.N = N,
+						...	
+					} = p;
+	 xrlinc(p->r0); 
+    for (i = p->r_begin, ie = p->r_end; i < ie && i < N; i++)
+    {
+		 double sum = 0.0;
+		 int j;
+		 for( j = 0 ; j < N ; j++ )
+			 sum += eval_A(i,j) * u[j];
+		 xlinc(p->r1); // write TMP
+       tmp[i] = sum; //tmp_i;
+		 xldec(p->r1);
+    }
+	 xrldec(p->r0);
+}
+
+// no read/write access for v, 
+// read-only access for u,
+// read-only access for tmp
+static void
+eval_At_times_u(struct Param <`r0::X,`r1::X,`r2::X,`r3::X> @p)
+@xrgn
+@nothrow
+{
+    int          i,k;
+    int          ie;
+
+    let &Param{<`i> 
+						.tmp=tmp,
+					 	.v = v,
+						.N = N,
+						...	
+					} = p;
+ 	 xrlinc(p->r1);
+    for (i = p->r_begin, ie = p->r_end; i < ie && i < N; i++)
+    {
+		  double sum = 0.0;
+        int     j;
+        for (j = 0; j <  N; j++) 
+			   sum += eval_A(j,i) * tmp[j];
+		 xlinc(p->r2); // write V
+		 v[i] = sum; // v_i;
+		 xldec(p->r2);
+    }
+	 xrldec(p->r1);
+}
+
+static void
+eval_AtA_times_u(struct Param <`r0::X,`r1::X,`r2::X,`r3::X> @ p,
+					  int threads)
+@xrgn
+{
+    eval_A_times_u(p); // u(R),tmp(-),v(-)
+//    fprintf(stderr,"\n[%d] before first barrier", Core::tid());
+	 barrier(threads);
+  //  fprintf(stderr,"\n[%d] after first barrier", Core::tid());
+    eval_At_times_u(p); // u(-),tmp(R),v(-)
+	 barrier(threads);
+//    fprintf(stderr,"\n[%d] after second barrier", Core::tid());
+}
+
+// u(R),tmp(-),v(R)
+static void do_add(struct Param <`r0::X,`r1::X,`r2::X,`r3::X> @ p)
+@xrgn
+{
+    let &Param{<`i> 
+					 	.v = v,
+						.u = u,
+						.N = N,
+						...
+					} = p;
+	 double tmp0 = 0.0,tmp1=0.0;
+	 int i,ie; 
+
+ 	 // u(R),tmp(-),v(R)
+    xrlinc(p->r0);
+	 xrlinc(p->r2);
+    for (i = p->r_begin, ie = p->r_end; i < ie && i < N; i++) {
+    	tmp0 += v[i] * v[i]; 
+    	tmp1 += u[i] * v[i]; 
+	 }
+	 xrldec(p->r0);
+	 xrldec(p->r2);
+	 xlinc(p->r3); // write TMP
+    *p->vv  += tmp0;
+    *p->vBv += tmp1;
+	 xldec(p->r3);
+}
+
+static void
+compute(struct Param<`r0::X,`r1::X,`r2::X,`r3::X> p, 
+			int tid, int threads)
+ @xrgn 
+ @re_entrant 
+{
+  let Param{<`i> 
+						.u = u,
+						.tmp=tmp,
+					 	.v = v,
+						.N = N,
+						...	
+					} = p;
+   int chunk = N / threads;
+	int begin = tid * chunk;
+	int end = (tid < (threads -1)) ?
+	            (begin + chunk) : N;
+
+  struct Param<`r2::X,`r1::X,`r0::X,`r3::X>   p1 =
+			{
+				.u = v,
+				.tmp = tmp,
+				.v = u,
+				.N = N,
+				.N2 = N/2,
+				.r_begin = (p.r_begin=begin),
+				.r_end = (p.r_end=end), 
+				.vv = p.vv,
+				.vBv = p.vBv,
+				.r0 = p.r2,
+				.r1 = p.r1,
+				.r2 = p.r0,
+				.r3 = p.r3
+			};
+
+	
+	 int ite;
+   // fprintf(stderr,"\n[%d] new thread", Core::tid());
+	 for (ite = 0; ite < 10; ite++)
+	 {
+//    	fprintf(stderr,"\n[%d] before first pass", Core::tid());
+ 		 eval_AtA_times_u(&p,threads);
+//    	fprintf(stderr,"\n[%d] first pass done", Core::tid());
+		 eval_AtA_times_u(&p1,threads);
+//    	fprintf(stderr,"\n[%d] second pass done", Core::tid());
+	 }
+
+		  do_add(&p);
+	    	
+//		 fprintf(stderr,"\n[%d] NEXT DONE", Core::tid());
+
+		 xdec(p.r0);
+		 xdec(p.r1);
+		 xdec(p.r2);
+		 xdec(p.r3);
+
+//    	fprintf(stderr,"\n[%d] EXITING", Core::tid());
+}
+
+#define THREADS CYC_SPECTRAL_THREADS
+int main(int argc, char*@fat *@fat argv) @throwsany{
+   let N<`i> = ((argc >= 2) ? atoi(argv[1]) : 2000);
+	region r @ Core::heap_region;
+	region w @ Core::heap_region;
+	region z @ Core::heap_region;
+	region x @ Core::heap_region;
+    __attribute__((aligned(64))) double * QUAL(r) u = 
+						rnew(r) { for i < N : 1.0 };
+  __attribute__((aligned(64))) double * QUAL(w) tmp = 
+					   rnew(w) {for i < N : 0.0 };
+  __attribute__((aligned(64))) double * QUAL(z) v = 
+					   rnew(z) {for i < N : 0.0 };
+  double @`x vv  = rnew(x) 0.0;
+  double @`x vBv  = rnew(x) 0.0;
+
+  struct Param  p1 =
+			{
+				.u = u,
+				.tmp = tmp,
+				.v = v,
+				.N = N,
+				.N2 = N/2,
+				.r_begin = 0,
+				.r_end = 0, 
+				.vv = vv,
+				.vBv = vBv,
+				.r0 = r,
+				.r1 = w,
+				.r2 = z,
+				.r3 = x 
+			};
+
+	 xldec(r);
+	 xldec(w);
+	 xldec(z);
+	 xldec(x);
+
+  for(int i = 0 ; i < THREADS ; i++) {
+	 xinc(r);
+	 xinc(w);
+	 xinc(z);
+	 xinc(x);
+	 spawn ($(r,1,0,0),$(w,1,0,0),$(z,1,0,0),$(x,1,0,0))
+			 compute(p1,i,THREADS);
+  }
+  Core::main_join();
+  xlinc(x);
+  double v1 = *vBv,v2 = *vv;
+  xldec(x);
+  double s = sqrt(v1/v2);
+  printf("%.9f\n",s);
+  xdec(x);
+  xdec(r);
+  xdec(w);
+  xdec(z);
+  return 0;
+}
+#else
+ #include <pthread.h> 
+ void Cyc_barrier(int thread_nr) {
+    static int count = 0;
+    static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+    static pthread_mutex_t barrier_mutex = PTHREAD_MUTEX_INITIALIZER;
+     pthread_mutex_lock(&barrier_mutex);
+     count++;
+     if (count == thread_nr) {
+       pthread_cond_broadcast(&condition);
+       count = 0;
+     }
+     else
+       pthread_cond_wait(&condition, &barrier_mutex);
+     pthread_mutex_unlock(&barrier_mutex);
+ }
+#endif 

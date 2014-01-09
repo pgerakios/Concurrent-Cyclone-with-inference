@@ -1,0 +1,182 @@
+/* This file is part of the Cyclone Library.
+   Copyright (C) 2000-2001 Greg Morrisett, AT&T
+
+   This library is free software; you can redistribute it and/or it
+   under the terms of the GNU Lesser General Public License as
+   published by the Free Software Foundation; either version 2.1 of
+   the License, or (at your option) any later version.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public
+   License along with this library; see the file COPYING.LIB.  If not,
+   write to the Free Software Foundation, Inc., 59 Temple Place, Suite
+   330, Boston, MA 02111-1307 USA. */
+
+// a simple chaining, polymorphic hash table with restore
+// of course this is not functional
+
+#include <list.h>
+#include <core.h>
+#include <hashtable.h>
+#include <cycboot.h>
+
+namespace Hashtable;
+using List;
+
+/*abstract*/
+struct Table<`a,`b,`r::R> {
+  region_t<`r> r;
+  int          (@cmp)(`a,`a);
+  int          (@hash)(`a);
+  int	       max_len; // maximum length of bucket list before resize
+  list_t<$(`a,`b)@`r,`r> ?`r tab;
+};
+
+table_t<`a,`b,`r> rcreate(region_t<`r> r, int sz, int (@`H cmp)(`a,`a), 
+                          int (@`H hash)(`a)) {
+  return rnew(r) Table{r, cmp, hash, 3, rcalloc(r,sz,sizeof(list_t))};
+}
+
+table_t<`a,`b> create(int sz, int (@`H cmp)(`a,`a), 
+                              int (@`H hash)(`a)) {
+  return rcreate(Core::heap_region, sz, cmp, hash);
+}
+
+void insert(table_t<`a,`b> t, `a key, `b val) {
+  list_t<$(`a,`b)@> ?tab   = t->tab;
+  int             bucket = (t->hash)(key) % numelts(tab);
+  tab[bucket] = rnew(t->r) List(rnew(t->r) $(key,val),tab[bucket]);
+  if (length(tab[bucket]) > t->max_len) 
+    resize(t);
+}
+
+`b lookup(table_t<`a,`b> t, `a key) { // throws Not_found
+  list_t<$(`a,`b)@> ?tab   = t->tab;
+  list_t<$(`a,`b)@> l      = tab[(t->hash)(key) % numelts(tab)];
+  return assoc_cmp(t->cmp, l, key);
+}
+
+`b*`r lookup_opt(table_t<`a,`b,`r> t, `a key) {
+  let tab = t->tab;
+  let l = tab[(t->hash)(key) % numelts(tab)];
+  let cmp = t->cmp;
+  for (; l != NULL; l = l->tl) {
+    let &$(k,*v) = l->hd;
+    if (cmp(key,k) == 0) return v;
+  }
+  return NULL;
+}
+
+bool try_lookup(table_t<`a,`b> t, `a key, `b@ data) {
+  let tab = t->tab;
+  let l = tab[(t->hash)(key) % numelts(tab)];
+  let cmp = t->cmp;
+  for (; l != NULL; l = l->tl) {
+    let $(k,v) = *l->hd;
+    if (cmp(key,k) == 0) {
+      *data = v;
+      return true;
+    }
+  }
+  return false;
+}
+
+void remove(table_t<`a,`b> t, `a key) {
+  // remove the most recent binding; silently return if none.
+  // does a destructive list update since this data structure is not functional
+  let tab = t->tab;
+  let cmp = t->cmp;
+  int bucket = (t->hash)(key) % numelts(tab);
+  let l = tab[bucket];
+  if (l == NULL) return;
+  if (cmp(key,l->hd[0][0]) == 0) {
+    tab[bucket] = l->tl;
+    return;
+  }
+  for (let next = l->tl; l->tl != NULL; l = l->tl, next = next->tl)
+    // invariant: l != NULL != l->tl == next, l->hd should not be removed
+    if (cmp(key,next->hd[0][0]) == 0) {
+      l->tl = next->tl;
+      return;
+    }
+}
+
+int hash_string(string_t s) {
+  // could be made faster by explicit loop unrolling
+  int ans   = 0;
+  int sz    = numelts(s);
+  int shift = 0;
+  for (int i=0; i < sz; ++i) {
+    ans = ans ^ (s[i] << shift);
+    shift += 8;
+    if(shift == 32)
+      shift = 0;
+  }
+  return ans;
+}
+
+int hash_stringptr(stringptr_t s) {
+  return hash_string(*s);
+}
+
+// For resizing
+void insert_bucket(region_t<`r> r,
+                   list_t<$(`a,`b)@`r,`r> ?`r tab, int (@hash)(`a),
+                   list_t<$(`a,`b)@> elems) {
+  if (elems == NULL) return;
+  insert_bucket(r,tab,hash,elems->tl); // preserve the original order
+  `a  key  = elems->hd[0][0];
+  `b  val  = elems->hd[0][1];
+  int nidx = (hash)(key) % numelts(tab);
+  tab[nidx] = rnew(r) List(rnew(r) $(key,val),tab[nidx]);
+}
+
+void resize(table_t<`a,`b> t) {
+  list_t<$(`a,`b)@> ?odata   = t->tab;
+  int             osize    = numelts(odata);
+  int             nsize    = 2 * osize + 1;
+  list_t<$(`a,`b)@> ? ndata  = rcalloc(t->r,nsize,sizeof(list_t));
+  for (int i = 0; i<osize; i++)
+    insert_bucket(t->r,ndata,t->hash,odata[i]);
+  t->tab     = ndata;
+  t->max_len = 2 * t->max_len;
+}
+
+// Iterating over a hashtable
+void iter(void f(`a,`b), table_t<`a,`b> t) {
+  list_t<$(`a,`b)@> ?odata   = t->tab;
+  int             osize    = numelts(odata);
+  for (int i = 0; i<osize; i++) 
+    for(list_t<$(`a,`b)@> iter = odata[i]; iter != NULL; iter = iter->tl) 
+      f(iter->hd[0][0],iter->hd[0][1]);
+}
+
+void iter_c(void f(`a,`b,`c), table_t<`a,`b> t, `c env) {
+  list_t<$(`a,`b)@> ?odata   = t->tab;
+  int             osize    = numelts(odata);
+  for (int i = 0; i<osize; i++) 
+    for(list_t<$(`a,`b)@> iter = odata[i]; iter != NULL; iter = iter->tl) 
+      f(iter->hd[0][0],iter->hd[0][1],env);
+}  
+
+// debugging
+void print_table_map(table_t<`a,`b> t, 
+                     void prn_key(`a), void prn_val(`b)){
+  list_t<$(`a,`b)@> ?odata = t->tab;
+  int osize = numelts(odata);
+  for (int i = 0; i<osize; i++) {
+    printf("%d: ",i);
+    for(list_t<$(`a,`b)@> iter = odata[i]; iter != NULL; iter = iter->tl) {
+      printf("(");
+      prn_key(iter->hd[0][0]);
+      printf(",");
+      prn_val(iter->hd[0][1]);
+      printf(") ");
+    }
+    printf("\n");
+  }
+}  

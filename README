@@ -1,0 +1,37 @@
+
+Extended Cyclone has been tested on 
+Linux 2.6.26-2-686 32-bit. 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+Currently, 64-bit systems are not supported
+neither are Linux kernels newer Linux 2.6.26-2
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+REQUIRES: libapr1-dev 
+----------------------------------------------
+
+----------------------------------------------
+Installation instructions:
+----------------------------------------------
+
+tar -xzf cyc_reglock.tgz
+cd cyc_reglock
+./configure --prefix=INSTALLATION_PREFIX
+make
+make install
+
+----------------------------------------------
+Run shootout:
+----------------------------------------------
+
+cd shootout
+make 
+
+Invoke compiler:
+
+bin/cyclone
+
+*or*
+
+INSTALLATION_PREFIX/bin/cyclone

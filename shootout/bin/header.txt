@@ -1,0 +1,11 @@
+\begin{table}[t]
+\centering\small%
+\def\arraystretch{1.1}%
+\def\benchmark#1{\hline\multirow{2}{*}{#1}}%
+\begin{tabular}{lcrrr@{\ }r@{\ }r@{\ }rrr}
+\hline
+benchmark & lang & CPU
+     & \multicolumn{1}{c}{memory}
+     & \multicolumn{4}{c}{load per core (\%)}
+     & elapsed
+     & factor \\

@@ -1,0 +1,24 @@
+#define XRGN
+#include <core.h> 
+
+region_t<`H> g(int b) {
+  return   Core::heap_region;
+}
+
+int a = 0;
+ int f() {
+   region r @ 
+   (a?Core::heap_region:
+       g(3+a)); 
+   int a = 0;
+   int b = 4;
+      a = 10;
+      b = 5;
+      { int c = 30;
+        c++;
+      }
+      return 100;
+ } 
+int main(){
+  int *`H p =&a;
+}

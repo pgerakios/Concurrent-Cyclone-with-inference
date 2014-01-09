@@ -1,0 +1,750 @@
+/* Eliminate GCC specific forms from abstract syntax.
+   Copyright (C) 2001 Dan Grossman.
+   This file is part of the Cyclone compiler.
+
+   The Cyclone compiler is free software; you can redistribute it
+   and/or modify it under the terms of the GNU General Public License
+   as published by the Free Software Foundation; either version 2 of
+   the License, or (at your option) any later version.
+
+   The Cyclone compiler is distributed in the hope that it will be
+   useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with the Cyclone compiler; see the file COPYING. If not,
+   write to the Free Software Foundation, Inc., 59 Temple Place -
+   Suite 330, Boston, MA 02111-1307, USA. */
+
+// The translation to C in Toc uses gcc extensions.  This file implements
+// a post-pass that tries to eliminate using any such extensions, namely
+// StmtExp.  Note RemoveAggrs removed most array initializers.
+//
+// Caveats:
+//  * It hoists declarations out a bit.  So lifetimes may be slightly 
+//    different, but you'll never notice (gcc hoists anyway instead of
+//    constantly pushing/popping the stack).
+//  * It gensyms functions for anything complicated, including the 
+//    translation of comprehensions and array initializers
+//  * This is just a hack for Dan to push a device driver into Win2000.
+
+// So far, all we do is get rid of StmtExp.  The idea is this:
+//   * hoist declarations to outside of the nearest enclosing statement,
+//     without hoisting initializers
+//   * where the declaration was, put an assignment (unless the initializer
+//     is not an expression, then generate a function)
+//   * change statement sequence to expression sequence (; to ,)
+//   * change if to conditional
+//   * anything gets translated to a function call with addresses of all
+//     the free variables in the statement.  This will happen for
+//     comprehensions and possibly for user-defined StmtExp.  We could do
+//     this for every StmtExp, but it's much uglier and less efficient, so
+//     we have the special-cases for decls, sequences, and ifs.  Actually,
+//     the special cases are necessary to get the right type for the resulting
+//     expression (the generated functions don't return values)
+//     Fortunately, you can have (f(), 3) where f() has type void.
+// A final complication when creating functions is the translation to C
+//  doesn't set var bindings, so we collect up the vardecls so we can get 
+//  the types we need.  Bleach.
+
+// FIX: Does the wrong thing if return appears in a StmtExp.  Similar for
+//   jumps (depending on where the source and target end up -- potentially
+//   in different functions which doesn't work)
+
+// Note: We have to splice generated functions into the right place
+//       b/c they can mention types not defined at the top.  And that means
+//       the translation could fail with local type declarations, which we
+//       don't have yet.
+#include <set.h>
+#include <dict.h>
+#include <string.h>
+#include "absynpp.h" // For debugging
+#include "tcutil.h"
+#include "toc.h"
+#include "tovc.h"
+
+using Core;
+using List;
+using Absyn;
+namespace Tovc;
+
+int elim_array_initializers = 1; // a flag
+
+#define DL 0
+
+// have varmaps because hoisted decls should be renamed to avoid conflicts.
+
+struct BoxingEnv<`r::R,`r2::R> {
+  region_t<`r> rgn;
+  list_t<vardecl_t,`r> all_locals; // for getting type info for freevars
+  Dict::dict_t<var_t,exp_t,`r> varmap; 
+  list_t<vardecl_t,`r> boundvars;  // do not box these
+  Set::set_t<vardecl_t,`r> @`r2 freevars; // params to generated function
+};
+typedef struct BoxingEnv<`r,`r2> boxingenv_t<`r,`r2>; // not boxed
+
+struct ToExpEnv<`r::R> {
+  region_t<`r> rgn;
+  list_t<vardecl_t,`r> all_locals; // for getting type info for freevars
+  Dict::dict_t<var_t,exp_t,`r> varmap; 
+  stmt_t encloser; // where to put hoisted locals
+  list_t<decl_t>@`r gen_ds; // for generated functions
+};
+typedef struct ToExpEnv<`r> toexpenv_t<`r>; // not boxed
+
+#define BOX_EXP_AND_UPDATE(env,e)		\
+{ let __ei = box_free_vars_exp(env,e);		\
+  if (__ei != NULL) e = __ei; }
+
+static exp_opt_t box_free_vars_exp(boxingenv_t<`r,`r2> env, exp_t e) {
+  while(true)
+  switch (e->r) {
+  case &Var_e(b):
+    switch(binding2qvar(b)) {
+    case &$({.Loc_n = _},v):
+      // DO NOT MUTATE qvars -- They get shared in funky ways
+      // first apply the varmap
+      if (Dict::member(env.varmap,v)) {
+	e->r = Dict::lookup(env.varmap,v)->r;
+	continue;
+      }
+      // Don't box if it's a global (defined in cyc_include.h, inserted by toc)
+      for (int i = 0; i < numelts(Toc::globals); i++)
+	if (strptrcmp(v,Toc::globals[i])==0)
+	  return NULL;
+      // now determine if it's free or bound
+      for (; env.boundvars != NULL; env.boundvars = env.boundvars->tl)
+	if (strptrcmp(v,(*env.boundvars->hd->name)[1])==0)
+	  return NULL;
+      // okay, it's free
+      for (; env.all_locals != NULL; env.all_locals = env.all_locals->tl) {
+	let vd = env.all_locals->hd;
+	if (strptrcmp(v,(*vd->name)[1])==0) {
+	  *env.freevars = Set::rinsert(env.rgn,*env.freevars,vd);
+	  // don't deref if it's a stack-allocated array 
+	  switch (vd->type) {
+	  case &ArrayType(_): return NULL;
+	  default: return deref_exp(var_exp(vd->name,DL),DL);
+	  }
+	}
+      }
+      
+      //FJS: if its a local var that does hit either of the previous cases 
+      //     (bound or free), throw exception
+      for (; env.all_locals != NULL; env.all_locals = env.all_locals->tl)
+	if (strptrcmp(v,(*env.all_locals->hd->name)[1])==0) {
+	  throw new Impossible(aprintf("unbound variable %s found in box_free_vars_exp", *v));
+	}
+      
+      //FJS: if it's neither a local var or a global var, assume it is from the header file
+      //     (eg. _get_zero_arr_size_char)
+      return NULL;
+    default: return NULL;
+    }
+
+    // the next group of expressions could possibly be in lvals, so
+    // we copy them, rather than mutate them.
+  case &Subscript_e(e1,e2):
+    let e1b = box_free_vars_exp(env,e1);
+    let e2b = box_free_vars_exp(env,e2);
+    if (e1b != NULL) {
+      if (e2b != NULL) {
+	let eb = subscript_exp(e1b,e2b,e->loc);
+	eb->topt = e->topt;
+	eb->annot = e->annot;
+	return eb;
+      }
+      else {
+	let eb = subscript_exp(e1b,e2,e->loc);
+	eb->topt = e->topt;
+	eb->annot = e->annot;
+	return eb;
+      }
+    }
+    else if (e2b != NULL) {
+      let eb = subscript_exp(e1,e2b,e->loc);
+      eb->topt = e->topt;
+      eb->annot = e->annot;
+      return eb;
+    }
+    return NULL;
+
+  case &Address_e(e1):
+    let e1b = box_free_vars_exp(env,e1);
+    if (e1b != NULL) {
+      let eb = address_exp(e1b, e->loc);
+      eb->topt = e->topt;
+      eb->annot = e->annot;
+      return eb;
+    }
+    return NULL;
+
+  case &Deref_e(e1):
+    let e1b = box_free_vars_exp(env,e1);
+    if (e1b != NULL) {
+      let eb = deref_exp(e1b, e->loc);
+      eb->topt = e->topt;
+      eb->annot = e->annot;
+      return eb;
+    }
+    return NULL;
+
+  case &AggrMember_e(e1,fn,ist,isr):
+    let e1b = box_free_vars_exp(env,e1);
+    if (e1b != NULL) {
+      let eb = new_exp(new AggrMember_e(e1b,fn,ist,isr), e->loc);
+      eb->topt = e->topt;
+      eb->annot = e->annot;
+      return eb;
+    }
+    return NULL;
+
+  case &AggrArrow_e(e1,fn,ist,isr):
+    let e1b = box_free_vars_exp(env,e1);
+    if (e1b != NULL) {
+      let eb = new_exp(new AggrArrow_e(e1b,fn,ist,isr), e->loc);
+      eb->topt = e->topt;
+      eb->annot = e->annot;
+      return eb;
+    }
+    return NULL;
+
+    // everything else is just recursive descent, using mutation
+  case &Const_e(_): return NULL;
+  case &FnCall_e(*e1,es,...):
+    BOX_EXP_AND_UPDATE(env,*e1);
+    fallthru(es);
+  case &Primop_e(_,es):
+    for (; es != NULL; es = es->tl) {
+      BOX_EXP_AND_UPDATE(env,es->hd);
+    }
+    return NULL;
+
+  case &Conditional_e(*e1,*e2,*e3):
+    BOX_EXP_AND_UPDATE(env,*e3);
+    fallthru(e1,e2);
+  case &And_e(*e1,*e2):           fallthru(e1,e2);
+  case &Or_e(*e1,*e2):            fallthru(e1,e2);
+  case &SeqExp_e(*e1,*e2):        fallthru(e1,e2);
+  case &AssignOp_e(*e1, _, *e2):
+    BOX_EXP_AND_UPDATE(env,*e2);
+    fallthru(e1);
+
+  case &NoInstantiate_e(*e1):    fallthru(e1);
+  case &Instantiate_e(*e1,_):    fallthru(e1);
+  case &Cast_e(_,*e1,_,_):       fallthru(e1);
+  case &Sizeofexp_e(*e1):        fallthru(e1);
+  case &Increment_e(*e1,_):
+    BOX_EXP_AND_UPDATE(env,*e1);
+    return NULL;
+
+  case &Sizeoftype_e(_): 
+  case &Offsetof_e(_,_):
+  case &Enum_e(...):   return NULL;
+
+  case &UnresolvedMem_e(_,dles):
+    for (; dles != NULL; dles = dles->tl) {
+      BOX_EXP_AND_UPDATE(env,(*dles->hd)[1]);
+    }
+    return NULL;
+
+  default: throw new Impossible("bad exp form in Tocv::box_free_vars_exp");
+  }
+}
+
+static void box_free_vars_stmt(boxingenv_t<`r,`r2> env, stmt_t s) {
+  // replaces all free local occurrences of x with *x.  Returns free vars.
+  // Note that for handling the translation of comprehensions we could get away
+  // with a lot less here, but may as well get it right the first time. :-)
+  while(true)
+    switch (s->r) {
+    case &Skip_s: return;        
+    case &Break_s: 
+      Tcutil::warn(s->loc,"break in eliminated statement expression");   
+      return;
+    case &Continue_s: 
+      Tcutil::warn(s->loc,"continue in eliminated statement expression");   
+      // FIX: reject if goto is to a different function (a pain to detect)
+      //  (Similarly a label that has gotos from different functions)
+      return;
+    case &Goto_s(_):   
+      Tcutil::warn(s->loc,"goto in eliminated statement expression");   
+      return;
+    case &Label_s(_,s2):
+      s = s2;
+      continue;
+    case &Return_s(*eopt):
+      Tcutil::warn(s->loc,"return in eliminated statement expression");   
+      // FIX: reject this -- it won't be in the right function.
+      if (*eopt != NULL) {
+	let ei = box_free_vars_exp(env,(exp_t)*eopt);
+	if (ei != NULL) *eopt = ei;
+      }
+      return;
+    case &Exp_s(*e):
+      BOX_EXP_AND_UPDATE(env,*e);
+      return;
+    case &Seq_s(s1,s2):
+      box_free_vars_stmt(env, s1);
+      s = s2;
+      continue;
+    case &IfThenElse_s(*e,s1,s2):
+      BOX_EXP_AND_UPDATE(env,*e);
+      box_free_vars_stmt(env, s1);
+      s = s2;
+      continue;
+    case &While_s($(*e,_),s2):
+      BOX_EXP_AND_UPDATE(env,*e);
+      s = s2;
+      continue;
+    case &For_s(*e1,$(*e2,_),$(*e3,_),s2):
+      BOX_EXP_AND_UPDATE(env,*e1);
+      BOX_EXP_AND_UPDATE(env,*e2);
+      BOX_EXP_AND_UPDATE(env,*e3);
+      s = s2;
+      continue;
+    case &Do_s(s2,$(*e,_)):
+      BOX_EXP_AND_UPDATE(env,*e);
+      s = s2;
+      continue;
+    case &Switch_s(*e,scs,_):
+      // most switches have been translated away -- so no binding occurrences!
+      BOX_EXP_AND_UPDATE(env,*e);
+      for (; scs != NULL; scs = scs->tl)
+	box_free_vars_stmt(env, scs->hd->body);
+      return;
+    case &Decl_s(d,s2):
+      switch (d->r) {
+      case &Var_d(vd):
+	env.boundvars = rnew(env.rgn) List(vd,env.boundvars);
+	env.varmap    = Dict::rdelete_same(env.varmap, (*vd->name)[1]);
+	if (vd->initializer != NULL) {
+	  let ei = box_free_vars_exp(env,(exp_t)vd->initializer);
+	  if (ei != NULL) vd->initializer = ei;
+	}
+	s = s2;
+	continue;
+      default: break;
+      }
+      fallthru;
+    default: throw new Impossible("bad stmt after xlation to C");
+    }
+}
+
+/* Compare two vardecls by name, for use in stmt_to_fun
+   We use it there instead of ptr_cmp because ptr_cmp
+   address sensitive, and allocations are different
+   on every machine.  So, ptr_cmp caused our output to
+   be different on different machines.
+*/
+static int stmt_to_fun_cmp(vardecl_t x, vardecl_t y) {
+  return qvar_cmp(x->name,y->name);
+}
+
+static exp_t stmt_to_fun(toexpenv_t<`r> env, stmt_t s, type_t rettype) {
+  // vardecl types have not been boxed (yet)
+  // free_vars must only be locals b/c ingoring namespaces!
+  Set::set_t<vardecl_t,`r> freevars = Set::rempty(env.rgn,stmt_to_fun_cmp);
+  let boxenv = BoxingEnv(env.rgn,env.all_locals,env.varmap,NULL,&freevars);
+  box_free_vars_stmt(boxenv,s);
+  list_t<$(var_opt_t,tqual_t,type_t)@> params = NULL;
+  list_t<exp_t> args = NULL;
+  
+  Iter::iter_t<_,`stmt_to_fun> iter = Set::make_iter(Core::heap_region, freevars);
+  // having to initialize is a pain :-(
+  let vd = new Vardecl(Public,exn_name,0,empty_tqual(0),void_type,
+		       NULL,NULL,NULL,false);
+    // don't box if it's a stack-allocated array
+  while(Iter::next(iter,&vd))
+    switch (vd->type) {
+    case &ArrayType(ArrayInfo{elt_type,_,_,_,_}): 
+      params = new List(new $((*vd->name)[1], vd->tq, 
+			      cstar_type(elt_type,empty_tqual(0))),
+			params);
+      args = new List(var_exp(vd->name,DL), args); 
+      break;
+    default: 
+      params = new List(new $((*vd->name)[1], vd->tq, 
+			      cstar_type(vd->type,empty_tqual(0))),
+			params);
+      args = new List(address_exp(var_exp(vd->name,DL),DL), args);
+      break;
+    }
+  qvar_t funname = Toc::temp_var();
+  *env.gen_ds=
+    new List(new_decl(new Fn_d(new Fndecl(Static,false,funname,s,
+					  FnInfo(NULL,NULL,empty_tqual(0),
+						 rettype,params,false,NULL,
+						 NULL,NULL,
+						 NULL,NULL,NULL,NULL,NULL,NULL,NULL,Absyn::noreentrant),
+					  NULL,NULL,NULL)),DL),
+		       *env.gen_ds);
+  return fncall_exp(var_exp(funname,DL), args, DL);
+}
+
+static void apply_varmap(Dict::dict_t<var_t,exp_t,`r> varmap, exp_t e) {
+  switch (e->r) {
+  case &Var_e(b):
+    switch(binding2qvar(b)) {
+    case &$({.Loc_n = _},v):
+      if (Dict::member(varmap,v))
+	e->r = Dict::lookup(varmap,v)->r;
+      return;
+    default: return;
+    }
+
+    // everything else is just recursive descent
+  case &Const_e(_): return;
+  case &FnCall_e(e1,es,...):
+    apply_varmap(varmap,e1); fallthru(es);
+  case &Primop_e(_,es):
+    for (; es != NULL; es = es->tl)
+      apply_varmap(varmap,es->hd);
+    return;
+
+  case &Conditional_e(e1,e2,e3):
+     apply_varmap(varmap,e3); fallthru(e1,e2);
+  case &And_e(e1,e2):         fallthru(e1,e2);
+  case &Or_e(e1,e2):          fallthru(e1,e2);
+  case &Subscript_e(e1,e2):     fallthru(e1,e2);
+  case &SeqExp_e(e1,e2):        fallthru(e1,e2);
+  case &AssignOp_e(e1, _, e2):
+    apply_varmap(varmap,e2);  fallthru(e1);
+
+  case &NoInstantiate_e(e1):  fallthru(e1);
+  case &Instantiate_e(e1,_):  fallthru(e1);
+  case &Cast_e(_,e1,_,_):     fallthru(e1);
+  case &Address_e(e1):        fallthru(e1);
+  case &Sizeofexp_e(e1):      fallthru(e1);
+  case &Deref_e(e1):          fallthru(e1);
+  case &AggrMember_e(e1,...):   fallthru(e1); 
+  case &AggrArrow_e(e1,...):    fallthru(e1);
+  case &Increment_e(e1,_):
+    apply_varmap(varmap,e1);
+    return;
+
+  case &Sizeoftype_e(_):  
+  case &Offsetof_e(_,_): 
+  case &Enum_e(...): return;
+
+  case &UnresolvedMem_e(_,dles):
+    for (; dles != NULL; dles = dles->tl)
+      apply_varmap(varmap,(*dles->hd)[1]);
+    return;
+
+  default: throw new Impossible("bad exp form in Tocv::apply_varmap");
+  }
+}
+
+static exp_t stmt_to_exp(toexpenv_t<`r> env, stmt_t s) {
+  switch (s->r) {
+  case &Skip_s: return true_exp(DL);
+  case &Exp_s(e): 
+    apply_varmap(env.varmap,e);
+    return e;
+  case &Seq_s(s1,s2): 
+     /* don't inline to avoid order of evaluation differences */
+    let s1_new = stmt_to_exp(env,s1);
+    let s2_new = stmt_to_exp(env,s2);
+    return seq_exp(s1_new, s2_new, DL);
+  case &IfThenElse_s(e,s1,s2): 
+    apply_varmap(env.varmap,e);
+     /* don't inline to avoid order of evaluation differences */
+    let s1_new = stmt_to_exp(env,s1);
+    let s2_new = stmt_to_exp(env,s2);
+    return conditional_exp(e, s1_new, s2_new, DL);
+  case &Decl_s(d,s2):
+    switch (d->r) {
+    case &Var_d(vd):
+      // rename and add to varmap
+      let oldname = (*vd->name)[1];
+      let newqvar = Toc::temp_var();
+      vd->name = newqvar;
+      env.varmap = Dict::insert(env.varmap, oldname, var_exp(newqvar, DL));
+      let unresolvedmem_inits = NULL;
+      if (vd->initializer != NULL) {
+	apply_varmap(env.varmap, (exp_t)vd->initializer);
+	switch (((exp_t)vd->initializer)->r) {
+          // We have to work harder if the initializer is an unresolvedmem, since that's
+          // not a legal expression.  These are introduced in Toc (UnresolvedMems in
+          // user programs are eliminated by the typechecker) and (hopefully) they are
+          // only introduced for arrays and not other things.  Essentially we transform
+          //   int x[3] = { 1,2,3 };
+          // into something like
+          //   int x[3];
+          //   (x[0] = 1, x[1] = 2, x[2] = 3);
+          // FIX??: this does not handle the case of nested unresolvedmems, not sure
+          // if Toc generates these.
+        case &UnresolvedMem_e(_,dles): 
+          let var = var_exp(vd->name,DL);
+          for (unsigned i=0; dles != NULL; dles = dles->tl, ++i)
+            unresolvedmem_inits = new List(assign_exp(subscript_exp(var,uint_exp(i,DL),DL),
+                                                      (*dles->hd)[1],
+                                                      DL),
+                                           unresolvedmem_inits);
+          vd->initializer = NULL;
+	  break;
+	default: break;
+	}
+      }
+      env.all_locals = rnew(env.rgn) List(vd, env.all_locals);
+      // hoist decl, but not initializer
+      env.encloser->r = decl_stmt(d, new_stmt(env.encloser->r, DL), DL)->r;
+      let e = stmt_to_exp(env,s2);
+      if (vd->initializer != NULL) {
+	e = seq_exp(assign_exp(var_exp(vd->name,DL),(exp_t)vd->initializer, DL),
+		    e, DL);
+        vd->initializer = NULL;
+      }
+      for (; unresolvedmem_inits != NULL; unresolvedmem_inits = unresolvedmem_inits->tl)
+	e = seq_exp(unresolvedmem_inits->hd, e, DL);
+      return e;
+    default: throw new Impossible("bad local decl in Tovc::stmt_to_exp");
+    }
+  default: 
+    return stmt_to_fun(env,s,void_type);
+  }
+}
+
+static void stmt_to_vc(toexpenv_t<`r> env, stmt_t s); // mutual recursion
+
+static void exp_to_vc(toexpenv_t<`r> env, exp_t e) {
+  string_t bad_form = "";
+  switch (e->r) {
+  case &Const_e(_): return;
+  case &Var_e(_): return;
+
+  case &FnCall_e(e1,es,...):
+    exp_to_vc(env, e1); fallthru(es);
+  case &Primop_e(_, es):
+    for (; es != NULL; es = es->tl)
+      exp_to_vc(env, es->hd);
+    return;
+
+  case &Conditional_e(e1,e2,e3):
+    exp_to_vc(env, e3);          fallthru(e1,e2);
+  case &And_e(e1,e2):            fallthru(e1,e2);
+  case &Or_e(e1,e2):             fallthru(e1,e2);
+  case &Subscript_e(e1,e2):      fallthru(e1,e2);
+  case &SeqExp_e(e1,e2):         fallthru(e1,e2);
+  case &AssignOp_e(e1, _, e2):
+    exp_to_vc(env, e2);          fallthru(e1);
+
+  case &Extension_e(e1):     fallthru(e1);
+  case &NoInstantiate_e(e1): fallthru(e1);
+  case &Instantiate_e(e1,_): fallthru(e1);
+  case &Cast_e(_,e1,_,_):    fallthru(e1);
+  case &Address_e(e1):       fallthru(e1);
+  case &Sizeofexp_e(e1):     fallthru(e1);
+  case &Deref_e(e1):         fallthru(e1);
+  case &AggrMember_e(e1,...):  fallthru(e1); 
+  case &AggrArrow_e(e1,...):   fallthru(e1);
+  case &Increment_e(e1,_):
+    exp_to_vc(env, e1);
+    return;
+
+  case &Sizeoftype_e(_):  
+  case &Offsetof_e(_,_): 
+  case &AnonEnum_e(...):
+  case &Enum_e(...): return;
+
+  case &UnresolvedMem_e(_,dles):
+    // these get generated by the translation in sorta weird ways
+    // it's not clear to me the translation to C can't put these in illegal
+    // places, but that wouldn't be a VC-specific problem.
+    for (; dles != NULL; dles = dles->tl)
+      exp_to_vc(env, (*dles->hd)[1]);
+    return;
+
+  case &StmtExp_e(s):
+    // THE INTERESTING CASE
+    // first deal with nested statment expressions
+    //   a nested StmtExp causes s->r to be mutated, but that's okay.
+    stmt_to_vc(env, s);
+    // then do our work
+    e->r = stmt_to_exp(env, s)->r;
+    return;
+
+  case &Asm_e(...): return;
+
+  case &Pragma_e(...): bad_form = "Pragma_e"; break;
+  case &Throw_e(...): bad_form = "Throw_e"; break;
+  case &New_e(...): bad_form = "New_e"; break;
+  case &Tuple_e(...): bad_form = "Tuple_e"; break;
+  case &CompoundLit_e(...): bad_form = "CompoundLit_e"; break;
+  case &Array_e(...): bad_form = "Array_e"; break;
+  case &Comprehension_e(...): bad_form = "Comprehension_e"; break;
+  case &ComprehensionNoinit_e(...): bad_form = "ComprehensionNoinit_e"; break;
+  case &Aggregate_e(...): bad_form = "Aggregate_e"; break;
+  case &AnonStruct_e(...): bad_form = "AnonStruct_e"; break;
+//   case &AnonEnum_e(...): bad_form = "AnonEnum_e"; break;
+  case &Datatype_e(...): bad_form = "Datatype_e"; break;
+  case &Malloc_e(...): bad_form = "Malloc_e"; break;
+  case &Swap_e(...): bad_form = "Swap_e"; break;
+  case &Tagcheck_e(...): bad_form = "Tagcheck_e"; break;
+  case &Valueof_e(...): bad_form = "Valueof_e"; break;
+  }
+  throw new Impossible(aprintf("bad exp form %s (exp=|%s|) after xlation to C",
+			       bad_form, Absynpp::exp2string(e)));
+}
+
+static void stmt_to_vc(toexpenv_t<`r> env, stmt_t s) {
+  // This is just the recursive descent; we are not under a StmtExp.
+  while(true) {
+    env.encloser = s;
+    switch (s->r) {
+    case &Skip_s:         
+    case &Break_s:    
+    case &Continue_s: 
+    case &Goto_s(_):   return;
+    case &Label_s(_,s2):
+      s = s2;
+      continue;
+    case &Return_s(eopt):
+      if (eopt == NULL)
+	return;
+      fallthru((exp_t)eopt);
+    case &Exp_s(e):
+      exp_to_vc(env, e);
+      return;
+    case &Seq_s(s1,s2):
+      stmt_to_vc(env, s1);
+      s = s2;
+      continue;
+    case &IfThenElse_s(e,s1,s2):
+      exp_to_vc(env,e);
+      stmt_to_vc(env,s1);
+      s = s2;
+      continue;
+    case &While_s($(e,_),s2):
+      exp_to_vc(env, e);
+      s = s2;
+      continue;
+    case &For_s(e1,$(e2,_),$(e3,_),s2):
+      exp_to_vc(env, e1);
+      exp_to_vc(env, e2);
+      exp_to_vc(env, e3);
+      s = s2;
+      continue;
+    case &Do_s(s2,$(e,_)):
+      exp_to_vc(env, e);
+      s = s2;
+      continue;
+    case &Switch_s(e,scs,_):
+      // most switches have been translated away -- only C switches remain.
+      // there should be no where clauses, so ignore them.
+      exp_to_vc(env, e);
+      for (; scs != NULL; scs = scs->tl)
+	stmt_to_vc(env, scs->hd->body);
+      return;
+    case &Decl_s(d,s2):
+      switch (d->r) {
+      case &Var_d(vd):
+        if (elim_array_initializers) {
+          // first thing we do is compile-away array initializers b/c they
+          // might not have int constants as elements.  (Technically, 
+          // it's a C++ and gcc extension.  Who knew?)
+          // FIX: ignores designators (assumes sorted already)
+          switch (Tcutil::compress(vd->type)) {
+          case &ArrayType(_):
+            if (vd->initializer != NULL)
+              switch (vd->initializer->r) {
+              case &UnresolvedMem_e(_,dles):
+                vd->initializer = NULL;
+                // reverse order, but we promised nothing. :-)
+                exp_t  arr = var_exp(vd->name,DL);
+                stmt_t s3  = new_stmt(s2->r,DL);
+                for (unsigned i=0; dles != NULL; dles = dles->tl, ++i)
+                  s3 = seq_stmt(exp_stmt(assign_exp(subscript_exp(arr,
+                                                                  uint_exp(i,DL),
+                                                                  DL),
+                                                    (*dles->hd)[1], DL),DL),
+                                s3,DL);
+                s2->r = s3->r;
+                break;
+              default:
+		let msg = aprintf("|%s|: array type bad initializer", 
+				  Absynpp::stmt2string(s));
+		throw new Impossible(msg);
+              }
+            break;
+          default: break;
+          }
+        }
+	if (vd->initializer != NULL)
+	  exp_to_vc(env, (exp_t)vd->initializer);
+	env.all_locals = rnew(env.rgn) List(vd, env.all_locals);
+	s = s2;
+	continue;
+      default: break;
+      }
+      fallthru;
+    default: throw new Impossible("bad stmt after xlation to C");
+    }
+  }
+}
+
+list_t<decl_t> tovc(list_t<decl_t> old_ds) {
+  let new_ds = NULL;
+  for (; old_ds != NULL; old_ds = old_ds->tl) {
+    let next_d = old_ds->hd;
+    switch (next_d->r) {
+    case &Fn_d(fd):
+      // First insert a declaration for the function before its definition.
+      // This is in case a recursive call of the function is lifted out of
+      // the function body & therefore out of scope of the name of the function.
+      fd->cached_type = NULL; // This type might have regions and effects; the other
+                             // parts of the fndecl have already had these cleared by toc,
+                             // but not this field.  Since fndecl2typ uses the cached
+                             // type if possible, we need to clear it.
+      // FIX: if the param_vardecls are NULL then it's a good sign that 
+      // this was an extern "C include" function, so I'm just leaving it 
+      // alone...
+      if (fd->param_vardecls != NULL) { // else case will fallthru
+        region rgn; {
+          let gen_ds = rnew(rgn) NULL;
+          if (fd->param_vardecls == NULL) {
+            fprintf(stderr,"No param vardecls for function %s\n",
+                    *(*fd->name)[1]); fflush(stderr);
+          }
+          stmt_to_vc(ToExpEnv(rgn,
+                              rcopy(rgn,fd->param_vardecls->v),
+                              Dict::rempty(rgn,strptrcmp), // ptr eq possible?
+                              fd->body,
+                              gen_ds), 
+                     fd->body);
+          if (*gen_ds != NULL) {
+            vardecl_t vd = new Vardecl {fd->sc, fd->name, 0,const_tqual(0), 
+                                        Tcutil::fndecl2type(fd), NULL, NULL, 
+					fd->i.attributes, false};
+            new_ds = new List(new_decl(new Var_d(vd),DL),new_ds);
+            // fprintf(Stdio::stderr,"%s",*(*fd->name)[1]); Stdio::fflush(Stdio::stdout);
+            new_ds = append(*gen_ds,new_ds);
+          }
+        }
+      }
+      fallthru;
+    case &Var_d(_):         
+    case &Let_d(...): 
+    case &Letv_d(_):        
+    case &Region_d(...):
+    case &Aggr_d(_):
+    case &Datatype_d(_):
+    case &Enum_d(_):        
+    case &Typedef_d(_):
+      new_ds = new List(next_d, new_ds);
+      break;
+    case &Namespace_d(_,ds2): fallthru(ds2);
+    case &Using_d(_,ds2):     fallthru(ds2);
+    case &ExternC_d(ds2):     fallthru(ds2);
+    case &ExternCinclude_d(ds2,...):
+    case &Porton_d:
+    case &Portoff_d:
+    case &Tempeston_d:
+    case &Tempestoff_d:
+      throw new Impossible("nested translation unit after translation to C");
+    }
+  }
+  return imp_rev(new_ds);
+}

@@ -1,0 +1,254 @@
+# -*- Makefile -*-
+# CYCDIR must be defined by the environment for this file to work correctly.
+#
+# This file is normally invoked recursively by the top-level Cyclone
+# Makefile, which exports CYCDIR, so all is well.
+#
+# This file should be called from the directory where you want the results
+# of building the Cyclone library and/or compiler to be put.
+# By using flags, variables, etc., this file can be used to build
+# bootstrap iterations, compilers for other targets, debug/profile versions, etc
+
+include $(CYCDIR)/Makefile.inc
+VPATH=$(CYCDIR)/lib $(CYCDIR)/src $(CYCDIR)
+export CYCFLAGS
+
+# For bootstrapping, may want to override these with something appropriate
+CYCC:=$(CYCDIR)/bin/$(CYCCOMP)
+CYCLEX:=$(CYCDIR)/bin/cyclex$(EXE)
+CYCBISON:=$(CYCDIR)/bin/cycbison$(EXE)
+INC_PATH:=. include $(CYCDIR)/lib $(CYCDIR)/src $(CYCDIR)/include
+LIB_PATH:=$(CYCDIR)/lib
+LIBR:=$(CYCBOOTLIB)
+BUILDLIB:=$(CYCDIR)/bin/buildlib -B$(CYCDIR)/bin/lib/cyc-lib
+export CYCC CYCLEX CYCBISON INC_PATH LIB_PATH LIBR
+
+# Note, the -B arguments ensure that we use the correct cyc_include.h.
+#   If cyc_include.h is being changed, the new version should be in
+#   lib/cyc_include.h; the -B$(LIB_PATH) makes sure we use that one.
+#   On the other hand if there is no lib/cyc_include.h, then a rule
+#   below will copy bin/lib/cyc-lib/cyc_include.h to the current
+#   directory, and the -B. ensures we use that one.
+override CYCFLAGS += $(addprefix -I, $(INC_PATH)) -B. -B$(LIB_PATH) -save-c 
+# various flags to set
+ifdef DEBUGBUILD
+#override CYCFLAGS += -pp -g
+override CYCFLAGS += -g
+override CFLAGS += -g
+endif
+ifdef PROFILE
+override CYCFLAGS += -pg
+override CFLAGS += -pg
+endif
+ifdef ALLOC_PROFILE
+override CYCFLAGS += -pa
+endif
+### useless -- the -nogc flag only has an effect on linking
+#ifdef NOGC
+#override CYCFLAGS += -nogc
+#endif
+ifdef NOREGIONS
+override CYCFLAGS += -noregions
+endif
+ifdef OPTBUILD
+override CYCFLAGS += -O3
+override CFLAGS += -O3
+endif
+
+#CFLAGS += -g
+CYC_SRCS := $(addsuffix .cyc, $(CYCLONE_SRCS))
+
+all: libs $(CYCCOMP) cycdoc$(EXE) buildlib$(EXE)
+
+libs: $(CYCBOOTLIB) nogc.a runtime_cyc.a $(CYCLIB)
+
+cfiles: $(C_SRCS) cycdoc.c buildlib.c $(C_BOOT_LIBS) boot_cycstubs.c precore_c.h other_cfiles
+
+# These c files aren't genfiles needed for booting, but, it's
+# a good idea to make them anyway: building them can find problems
+# with buildlib or libc.cys.
+other_cfiles: cyc_setjmp.h cstubs.c cycstubs.cyc $(C_LIBS)
+
+
+
+cyc_setjmp.h cstubs.c cycstubs.cyc: libc.cys
+	-mkdir include
+	$(BUILDLIB) -d include -setjmp > cyc_setjmp.h
+	$(BUILDLIB) -d include $<
+	#PG: Dirty quickfix must be properly fixed ...
+	mv include/cstubs.c .
+	mv include/cycstubs.cyc .
+	sed 's/itn,//g' include/time.h > tmp
+	mv tmp include/time.h
+	grep -v ftello include/stdio.h | grep -v fseeko > tmp
+	mv tmp include/stdio.h
+
+libc.cys:
+	(test -e $(CYCDIR)/lib/libc.cys && cp $(CYCDIR)/lib/libc.cys $@) || cp $(CYCDIR)/bin/cyc-lib/libc.cys $@
+
+# The -L. makes sure that we pick up the libcyc.a of the current
+# directory.  The -B. makes sure we use the runtime_cyc.o of the
+# current directory, and the second -B makes sure we pick up the gc.a
+# of the current $(CYCDIR), and we avoid the libcyc.a and gc.a of any
+# version of Cyclone currently installed in the usual place.
+# Why don't these use $(CYCFLAGS) -- because that has -save-c which is
+#   irrelevant and the -B flags used there are to find cyc_include.h,
+#   not the .a files.
+ifdef PROFILE
+OTHER_CYCFLAGS += -pg
+endif
+ifdef ALLOC_PROFILE
+### Don't do this -- causes linker to look for
+### runtime_cyc_a.o and libcyc_a.a, wrong
+#OTHER_CYCFLAGS += -pa
+CFLAGS += -DCYC_REGION_PROFILE
+endif
+ifdef NOGC
+OTHER_CYCFLAGS += -nogc
+endif
+ifdef NOREGIONS
+OTHER_CYCFLAGS += -noregions
+endif
+
+$(CYCCOMP): $(O_SRCS) install_path.$(O) $(LIBR)
+	$(CYCC) -o $@ -v -compile-for-boot -L. -B. -B$(CYCDIR)/bin/lib/cyc-lib $(OTHER_CYCFLAGS) $(O_SRCS) install_path.$(O) $(LDFLAGS)
+
+cycdoc$(EXE): $(addsuffix .$(O), $(CYCDOC_SRCS)) install_path.$(O) $(LIBR)
+	$(CYCC) -o $@ -v -compile-for-boot -L. -B. -B$(CYCDIR)/bin/lib/cyc-lib $(OTHER_CYCFLAGS) $(addsuffix .$(O), $(CYCDOC_SRCS)) install_path.$(O) $(LDFLAGS)
+
+buildlib$(EXE): $(addsuffix .$(O), $(BUILDLIB_SRCS)) install_path.$(O) $(LIBR)
+	$(CYCC) -o $@ -v -compile-for-boot -L. -B. -B$(CYCDIR)/bin/lib/cyc-lib $(OTHER_CYCFLAGS) $(addsuffix .$(O), $(BUILDLIB_SRCS)) install_path.$(O) $(LDFLAGS)
+
+# FIX: the wchar stuff should be moved to the cycspecs file
+install_path.c: $(CYCDIR)/Makefile.inc
+	 (echo "char *Carch = \"$(build)\";"; \
+	  echo "char *Cdef_lib_path = \"$(LIB_INSTALL)\";"; \
+	  echo "char *Cversion = \"$(VERSION)\";"; \
+	  echo "int Wchar_t_unsigned = $(WCHAR_T_UNSIGNED);"; \
+	  echo "int Sizeof_wchar_t = $(SIZEOF_WCHAR_T);") > $@
+
+$(CYCLIB): $(O_LIBS) $(O_BOOT_LIBS) cstubs.$(O) cycstubs.$(O)
+ifdef MS
+	lib /out:$@ $^
+else
+	-$(RM) $@
+ifdef LC_FLAG
+	$(CYCC) -o $@ $(LC_FLAG) $^
+else
+	ar rc $@ $^
+	$(RANLIB) $@
+endif
+endif
+
+$(CYCBOOTLIB): $(O_BOOT_LIBS) boot_cstubs.$(O) boot_cycstubs.$(O)
+ifdef MS
+	lib /out:$@ $^
+else
+	-$(RM) $@
+ifdef LC_FLAG
+	$(CYCC) -o $@ $(LC_FLAG) $^
+else
+	ar rc $@ $^
+	$(RANLIB) $@
+endif
+endif
+
+nogc.a: nogc.o
+	ar rc $@ $^
+	$(RANLIB) $@
+
+#ifeq ($(HAVE_PTHREAD),yes)
+#ifeq ($@, $(findstring $@, $(O_RUNTIME) ))
+#	$(CC) -c -o $(basename $@)_pthread.o $(CFLAGS) -D_HAVE_PTHREAD_ -I.  $< 
+#endif
+#endif
+
+runtime_cyc.a: $(O_RUNTIME)
+#	@echo RUNTIME FILES: $(O_RUNTIME) and $(PWD)
+	ar rc $@ $^
+	$(RANLIB) $@
+#ifeq ($(HAVE_PTHREAD),yes)
+#	ar rc $(addsuffix _pthread.a , $(basename $@)) \
+               $(addsuffix _pthread.o , $(basename $^))
+#	$(RANLIB) $(addsuffix _pthread.a , $(basename $@))
+#endif
+
+
+cyc_include.h: $(CYCDIR)/bin/lib/cyc-lib/cyc_include.h
+	cp $< $@
+
+cycspecs: $(CYCDIR)/bin/lib/cyc-lib/$(build)/cycspecs
+	cp $< $@
+
+core.h: $(CYCDIR)/include/core.h
+	cp $< $@
+
+precore_c.h: core.h $(CYCC) cyc_include.h cycspecs
+	$(CYCC) -o $@ $(CYCFLAGS) -stopafter-toc -pp -D_CYC_GENERATE_PRECORE_C_ -nocyc -noremoveunused -noexpandtypedefs -nocyc_setjmp -x cyc $<
+
+
+#parse_tab.c: parse_tab.cyc
+#	$(CYCC) -c -o $@ -compile-for-boot $(CYCFLAGS) -D__FILE2__=\"$(notdir $<)\" $<
+
+%.cyc: %.cyl $(CYCLEX)
+	$(CYCLEX) $< $@
+%_tab.cyc: %.y $(CYCBISON)
+	$(CYCBISON) -d $< -o $@
+%_tab.h: %.y $(CYCBISON)
+	$(CYCBISON) -d $< -o $(patsubst %.h,%.cyc,$@)
+# For runtime_cyc.c and nogc.c and cstubs.c and boot_cstubs.c
+%.$(O): %.c precore_c.h cyc_include.h cyc_setjmp.h cycspecs 
+	$(CC) -Wall -c -o $@ $(CFLAGS) -I. $<
+#	$(if $(findstring $@, $(O_RUNTIME)), $(CC) -c -o $(basename $@)_pthread.o $(CFLAGS) -D_HAVE_PTHREAD_ -I. $< , ) 
+
+
+# The default rules for compiling .cyc files use the -compile-for-boot
+# flag, which causes #include <setjmp.h> to be used in all the
+# generated C files.  This makes the genfiles portable.  But,
+# we don't need this for non-compiler files (which won't end up
+# in bin/genfiles).  And for cycstubs.c, it would cause conflicts
+# because it would pull in extra C definitions that would conflict
+# with wrapper code we have in cycstubs.cyc.  So for just that file
+# we have another rule to omit -compile-for-boot (and so the
+# compiler special file cyc_setjmp.h will be used instead).
+cycstubs.c: cycstubs.cyc $(CYCC) cyc_include.h cyc_setjmp.h cycspecs
+	$(CYCC) -c -o $@ $(CYCFLAGS) -D__FILE2__=\"$(notdir $<)\" -stopafter-toc $<
+
+%.c: %.cyc $(CYCC) cyc_include.h cyc_setjmp.h cycspecs
+	$(CYCC) -c -o $@ -compile-for-boot $(CYCFLAGS) -D__FILE2__=\"$(notdir $<)\" -stopafter-toc $<
+%.$(O): %.cyc $(CYCC) cyc_include.h cyc_setjmp.h cycspecs
+	$(CYCC) -c -o $@ -compile-for-boot $(CYCFLAGS) -D__FILE2__=\"$(notdir $<)\" $<
+
+ifdef MS
+%.obj: %.c precore_c.h cyc_include.h cyc_setjmp.h cycspecs
+	cl /I$(CYCDIR) /Dinline=__inline /c /w /nologo /Fo$@ $^
+endif
+
+# Always use the original compiler to avoid circularities
+# Note: In most cases, it would be correct to share .d files
+# Note: depends on cstubs.c so header files get built first
+# Note: the hairy stuff with sed is so that the dependency target
+#       is the .c file rather than the default .o file produced by -M.
+#       I'd prefer to use -MT but am having trouble.
+# Note: depends on parse_tab.h because of a bug in -MG in gcc.
+#	Namely, some files include parse.h which includes parse_tab.h
+#	which is a generated file; -MG is supposed to assume it is
+#	generated, but instead seems to handle it as an error, so that
+#	the generated .d file is empty.  So, we force parse_tab.h to
+#	be generated first.  The gcc bug occurs at least in gcc 3.1
+#	on Mac.
+# Note: the .SECONDARY causes the files to be treated as intermediate
+#	(generated) files EXCEPT they are not automatically deleted.
+#	This means they only get generated once; since one of the files
+#	is parse_tab.h this is particularly important, it means
+#	dependency analysis only happens once.
+%.d: %.cyc cstubs.c parse_tab.h
+	$(CYCDIR)/bin/$(CYCCOMP) -M -MG $(CYCFLAGS) -B$(CYCDIR)/bin/lib/cyc-lib $< > $@d
+	sed -e 's/\.o:/\.c:/' $@d > $@
+	$(RM) $@d
+
+.SECONDARY: parse_tab.cyc parse_tab.h lex.cyc lineno.cyc cycdoc.cyc buildlib.cyc
+
+ifndef NODEPS
+-include $(addsuffix .d, $(CYCLONE_BOOT_LIBS) $(CYCLONE_LIBS) $(CYCLONE_SRCS) cycdoc buildlib)
+endif
